@@ -595,12 +595,12 @@
       <div class="metric-card amber"><div class="metric-label">Total cost (THB)</div><div class="metric-value amber" id="ai-cost-thb">—</div><div class="metric-sub" id="ai-cost-usd">—</div></div>
     </div>
 
-    <div class="section-label">Avg cost per conversation turn by route</div>
+    <div class="section-label">Avg cost per LLM call by route</div>
     <div class="metric-grid metric-grid-4" style="margin-bottom:24px">
-      <div class="metric-card blue"><div class="metric-label">Overall avg / turn</div><div class="metric-value blue" id="ai-cppt-all">—</div><div class="metric-sub">THB</div></div>
-      <div class="metric-card teal"><div class="metric-label">Advisor / turn</div><div class="metric-value teal" id="ai-cppt-adv">—</div><div class="metric-sub">THB</div></div>
-      <div class="metric-card green"><div class="metric-label">Education / turn</div><div class="metric-value green" id="ai-cppt-edu">—</div><div class="metric-sub">THB</div></div>
-      <div class="metric-card amber"><div class="metric-label">Summary / turn</div><div class="metric-value amber" id="ai-cppt-sum">—</div><div class="metric-sub">THB</div></div>
+      <div class="metric-card blue"><div class="metric-label">Overall avg / call</div><div class="metric-value blue" id="ai-cppt-all">—</div><div class="metric-sub">THB</div></div>
+      <div class="metric-card teal"><div class="metric-label">Advisor / call</div><div class="metric-value teal" id="ai-cppt-adv">—</div><div class="metric-sub">THB</div></div>
+      <div class="metric-card green"><div class="metric-label">Education / call</div><div class="metric-value green" id="ai-cppt-edu">—</div><div class="metric-sub">THB</div></div>
+      <div class="metric-card amber"><div class="metric-label">Summary / call</div><div class="metric-value amber" id="ai-cppt-sum">—</div><div class="metric-sub">THB</div></div>
     </div>
 
     <div class="row2">
@@ -828,6 +828,9 @@
 </div>
 
 <script>
+// ── Config ────────────────────────────────────────────────────────────────────
+const MAIN_WF_ID = 'CQCLdVdNwrmvI5do'; // Prototype_v1.2 — defines a "conversation"
+
 // ── Global state ──────────────────────────────────────────────────────────────
 let sb = null;
 let activeDays = 7;
@@ -937,14 +940,14 @@ const baseOpts = {
 // ── OVERVIEW ──────────────────────────────────────────────────────────────────
 async function loadOverview(since) {
   const { data: rows } = await sb.from('execution_log')
-    .select('id,execution_id,session_id,customer_id,started_at,wall_time_ms,status,route_to,user_message')
+    .select('id,execution_id,session_id,customer_id,started_at,wall_time_ms,status,route_to,user_message,workflow_id')
     .gte('started_at', since)
     .order('started_at', { ascending: false })
     .limit(10000);
 
   if (!rows) return;
   const uniqueRows = [...new Map(rows.map(r => [r.execution_id, r])).values()];
-  const chatBotRows = uniqueRows.filter(r => !!r.session_id);
+  const chatBotRows = uniqueRows.filter(r => r.workflow_id === MAIN_WF_ID);
   const total = chatBotRows.length;
   const success = chatBotRows.filter(r => r.status === 'success').length;
   const rate = total ? ((success/total)*100).toFixed(1)+'%' : '—';
@@ -1038,21 +1041,19 @@ async function loadAI(since) {
   document.getElementById('ai-cost-thb').textContent = fmtThb(totalCostThb);
   document.getElementById('ai-cost-usd').textContent = '$'+fmt(totalCostUsd,4)+' USD';
 
-  // Cost per conversation turn by route
+  // Avg cost per LLM call by route
   const { data: execRows } = await sb.from('execution_log')
-    .select('execution_id,route_to').gte('started_at', since);
+    .select('execution_id,route_to,workflow_id').gte('started_at', since).limit(10000);
   const execRouteMap = {};
   (execRows||[]).forEach(r => { execRouteMap[r.execution_id] = r.route_to; });
+  const mappedRoutes = {};
+  rows.forEach(r => { const rt = execRouteMap[r.execution_id]||'__unmapped__'; mappedRoutes[rt]=(mappedRoutes[rt]||0)+1; });
+  console.log('[AI] agent_call_log rows:', rows.length, '| execution_log rows:', (execRows||[]).length, '| route distribution:', mappedRoutes);
 
   const routeCost = { all:{sum:0,cnt:0}, advisor:{sum:0,cnt:0}, education:{sum:0,cnt:0}, summary:{sum:0,cnt:0} };
-  // Group by execution_id to get per-turn cost
-  const turnCost = {};
   rows.forEach(r => {
-    if (!turnCost[r.execution_id]) turnCost[r.execution_id] = 0;
-    turnCost[r.execution_id] += (r.total_cost_thb||0);
-  });
-  Object.entries(turnCost).forEach(([eid, cost]) => {
-    const route = execRouteMap[eid] || 'unknown';
+    const cost = r.total_cost_thb||0;
+    const route = execRouteMap[r.execution_id] || 'unknown';
     routeCost.all.sum += cost; routeCost.all.cnt++;
     if (routeCost[route]) { routeCost[route].sum += cost; routeCost[route].cnt++; }
   });
@@ -1129,14 +1130,19 @@ async function loadAI(since) {
 
 // ── SUB-WORKFLOWS ─────────────────────────────────────────────────────────────
 async function loadSubworkflows(since) {
-  const { data: execRows } = await sb.from('execution_log').select('execution_id,session_id,started_at').gte('started_at', since).order('started_at', { ascending: false }).limit(10000);
+  const { data: execRows } = await sb.from('execution_log').select('execution_id,session_id,workflow_id,started_at').gte('started_at', since).order('started_at', { ascending: false }).limit(10000);
   const { data: agentRowsRaw } = await sb.from('agent_call_log').select('execution_id,workflow_name,processing_time_ms,total_tokens,total_cost_thb,started_at').gte('started_at', since).limit(10000);
 
   const uniqueExecRows = [...new Map((execRows||[]).map(r => [r.execution_id, r])).values()];
-  const chatBotExecRows = uniqueExecRows.filter(r => !!r.session_id);
+  const chatBotExecRows = uniqueExecRows.filter(r => r.workflow_id === MAIN_WF_ID);
   const totalExec = chatBotExecRows.length;
   const execIds = new Set(chatBotExecRows.map(r => r.execution_id));
   const agentRows = (agentRowsRaw||[]).filter(r => execIds.has(r.execution_id));
+  const wfNamesRaw = [...new Set((agentRowsRaw||[]).map(r=>r.workflow_name))];
+  const wfNamesFiltered = [...new Set(agentRows.map(r=>r.workflow_name))];
+  console.log('[SW] execIds:', execIds.size, '| agentRowsRaw:', (agentRowsRaw||[]).length, '→ agentRows after filter:', agentRows.length);
+  console.log('[SW] workflow_names in raw:', wfNamesRaw);
+  console.log('[SW] workflow_names after execId filter:', wfNamesFiltered);
 
   const { data: flagRows } = await sb.from('workflow_agent_flags')
     .select('*')
@@ -1203,10 +1209,10 @@ async function loadSubworkflows(since) {
     const pct = totalExec ? fmt((cnt/totalExec)*100)+'%' : '—';
     // Find matching workflow
     const wfName = Object.entries(wfFlagMap).find(([,v])=>v===s.key)?.[0]||'—';
-    const calls = (agentRows||[]).filter(r=>r.workflow_name===wfName).length || cnt;
+    const calls = (agentRows||[]).filter(r=>r.workflow_name===wfName).length;
     const avgTok = calls ? Math.round((wfTok[wfName]||0)/calls) : 0;
     const avgCost = calls ? (wfCost[wfName]||0)/calls : 0;
-    const avgLat = wfLat[wfName] ? Math.round(wfLat[wfName].reduce((a,b)=>a+b,0)/wfLat[wfName].length) : 0;
+    const avgLat = calls ? Math.round((wfLat[wfName]||[]).reduce((a,b)=>a+b,0)/calls) : 0;
     return `<tr>
       <td style="font-weight:500">${s.label}</td>
       <td class="td-right">${cnt.toLocaleString()}</td>
@@ -1287,13 +1293,13 @@ async function loadGuardrails(since) {
 // ── ROUTING ───────────────────────────────────────────────────────────────────
 async function loadRouting(since) {
   const { data: rawRows } = await sb.from('execution_log')
-    .select('execution_id,route_to,started_at,need_staff_contact,status,reply_type,session_id')
+    .select('execution_id,route_to,started_at,need_staff_contact,status,reply_type,session_id,workflow_id')
     .gte('started_at', since)
     .order('started_at', { ascending: false })
     .limit(10000);
   if (!rawRows) return;
 
-  const rows = [...new Map(rawRows.filter(r => !!r.session_id).map(r => [r.execution_id, r])).values()];
+  const rows = [...new Map(rawRows.filter(r => r.workflow_id === MAIN_WF_ID).map(r => [r.execution_id, r])).values()];
   const total = rows.length;
   const execIds = rows.map(r => r.execution_id);
 
@@ -1434,9 +1440,9 @@ async function loadErrors(since) {
 // ── SESSIONS ──────────────────────────────────────────────────────────────────
 async function loadSessions(since) {
   const { data: rows } = await sb.from('execution_log')
-    .select('execution_id,session_id,customer_id,started_at,wall_time_ms,route_to,status')
+    .select('execution_id,session_id,customer_id,started_at,wall_time_ms,route_to,status,workflow_id')
     .gte('started_at', since)
-    .not('session_id', 'is', null)
+    .eq('workflow_id', MAIN_WF_ID)
     .order('started_at', { ascending: true });
 
   if (!rows || !rows.length) {
@@ -1564,7 +1570,7 @@ function filterLogsToSession(sessionId) {
 async function loadLogs(since) {
   const [{ data: rows }, { data: agentRows }] = await Promise.all([
     sb.from('execution_log')
-      .select('execution_id,session_id,customer_id,started_at,wall_time_ms,route_to,status,user_message')
+      .select('execution_id,session_id,customer_id,started_at,wall_time_ms,route_to,status,user_message,workflow_id')
       .gte('started_at', since)
       .order('started_at', { ascending: false })
       .limit(500),
@@ -1604,8 +1610,8 @@ function renderLogs() {
   let filtered = allLogs;
   if (search)  filtered = filtered.filter(r => (r.session_id||'').toLowerCase().includes(search) || (r.customer_id||'').toLowerCase().includes(search));
   if (route)   filtered = filtered.filter(r => r.route_to === route);
-  if (status === 'chat-bot')   filtered = filtered.filter(r => !!r.session_id);
-  else if (status === 'no-session') filtered = filtered.filter(r => !r.session_id);
+  if (status === 'chat-bot')   filtered = filtered.filter(r => r.workflow_id === MAIN_WF_ID);
+  else if (status === 'no-session') filtered = filtered.filter(r => r.workflow_id !== MAIN_WF_ID);
   else if (status) filtered = filtered.filter(r => r.status === status);
 
   const totalPages = Math.max(1, Math.ceil(filtered.length / LOG_PAGE_SIZE));
