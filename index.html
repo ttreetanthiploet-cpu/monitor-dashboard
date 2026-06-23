@@ -708,7 +708,7 @@
 
   <!-- ── TAB: ROUTING ──────────────────────────────────── -->
   <div class="tab-panel" id="tab-routing">
-    <div class="section-label">Intent classification</div>
+    <div class="section-label">Route distribution (all conversations · some bypass classification)</div>
     <div class="metric-grid metric-grid-4" style="margin-bottom:24px">
       <div class="metric-card blue"><div class="metric-label">Advisor</div><div class="metric-value blue" id="rt-adv">—</div><div class="metric-sub" id="rt-adv-pct">—</div></div>
       <div class="metric-card teal"><div class="metric-label">Education</div><div class="metric-value teal" id="rt-edu">—</div><div class="metric-sub" id="rt-edu-pct">—</div></div>
@@ -734,10 +734,11 @@
 
     <div class="card">
       <div class="card-title">Staff escalation rate</div>
-      <div class="metric-grid metric-grid-3" style="margin-bottom:0">
+      <div class="metric-grid metric-grid-4" style="margin-bottom:0">
         <div class="metric-card amber"><div class="metric-label">Escalations (period)</div><div class="metric-value amber" id="rt-escl">—</div><div class="metric-sub" id="rt-escl-pct">—</div></div>
         <div class="metric-card blue"><div class="metric-label">Escalation rate</div><div class="metric-value blue" id="rt-escl-rate">—</div><div class="metric-sub">of all turns</div></div>
         <div class="metric-card green"><div class="metric-label">Confirmed plans</div><div class="metric-value green" id="rt-confirmed">—</div><div class="metric-sub">summary route reached</div></div>
+        <div class="metric-card teal"><div class="metric-label">Bypassed classification</div><div class="metric-value teal" id="rt-bypass">—</div><div class="metric-sub" id="rt-bypass-sub">direct route, no LLM routing</div></div>
       </div>
     </div>
   </div>
@@ -938,7 +939,8 @@ async function loadOverview(since) {
   const { data: rows } = await sb.from('execution_log')
     .select('id,execution_id,session_id,customer_id,started_at,wall_time_ms,status,route_to,user_message')
     .gte('started_at', since)
-    .order('started_at', { ascending: false });
+    .order('started_at', { ascending: false })
+    .limit(10000);
 
   if (!rows) return;
   const uniqueRows = [...new Map(rows.map(r => [r.execution_id, r])).values()];
@@ -949,7 +951,7 @@ async function loadOverview(since) {
   const avgMs = total ? Math.round(chatBotRows.reduce((s,r)=>s+(r.wall_time_ms||0),0)/total) : 0;
 
   // Fetch agent_call_log once for cost, latency, and per-execution token lookup
-  const { data: ovAgentRows } = await sb.from('agent_call_log').select('execution_id,workflow_name,processing_time_ms,total_tokens,total_cost_thb,started_at').gte('started_at', since);
+  const { data: ovAgentRows } = await sb.from('agent_call_log').select('execution_id,workflow_name,processing_time_ms,total_tokens,total_cost_thb,started_at').gte('started_at', since).limit(10000);
   const totalCostThb = (ovAgentRows||[]).reduce((s,r)=>s+(r.total_cost_thb||0),0);
   const totalCostUsd = totalCostThb / 36.5;
 
@@ -1016,7 +1018,8 @@ async function loadOverview(since) {
 async function loadAI(since) {
   const { data: rows } = await sb.from('agent_call_log')
     .select('agent_name,workflow_name,model_name,input_tokens,output_tokens,total_tokens,total_cost_thb,input_cost_usd,output_cost_usd,total_cost_usd,processing_time_ms,started_at,execution_id')
-    .gte('started_at', since);
+    .gte('started_at', since)
+    .limit(10000);
   if (!rows || !rows.length) return;
 
   const totalCalls = rows.length;
@@ -1126,16 +1129,19 @@ async function loadAI(since) {
 
 // ── SUB-WORKFLOWS ─────────────────────────────────────────────────────────────
 async function loadSubworkflows(since) {
-  const { data: flagRows } = await sb.from('workflow_agent_flags').select('*');
-  const { data: execRows } = await sb.from('execution_log').select('execution_id,session_id,started_at').gte('started_at', since);
-  const { data: agentRowsRaw } = await sb.from('agent_call_log').select('execution_id,workflow_name,processing_time_ms,total_tokens,total_cost_thb,started_at').gte('started_at', since);
+  const { data: execRows } = await sb.from('execution_log').select('execution_id,session_id,started_at').gte('started_at', since).order('started_at', { ascending: false }).limit(10000);
+  const { data: agentRowsRaw } = await sb.from('agent_call_log').select('execution_id,workflow_name,processing_time_ms,total_tokens,total_cost_thb,started_at').gte('started_at', since).limit(10000);
 
   const uniqueExecRows = [...new Map((execRows||[]).map(r => [r.execution_id, r])).values()];
   const chatBotExecRows = uniqueExecRows.filter(r => !!r.session_id);
   const totalExec = chatBotExecRows.length;
   const execIds = new Set(chatBotExecRows.map(r => r.execution_id));
   const agentRows = (agentRowsRaw||[]).filter(r => execIds.has(r.execution_id));
-  const relevantFlags = (flagRows||[]).filter(r => execIds.has(r.execution_id));
+
+  const { data: flagRows } = await sb.from('workflow_agent_flags')
+    .select('*')
+    .in('execution_id', [...execIds]);
+  const relevantFlags = flagRows||[];
 
   const SW = [
     { key:'used_input_guardrail',  label:'Input guardrail',    color:'#4f8ef7' },
@@ -1150,10 +1156,14 @@ async function loadSubworkflows(since) {
   const swCounts = {};
   SW.forEach(s => { swCounts[s.key] = relevantFlags.filter(r => r[s.key]).length; });
 
+  const flagCoverage = relevantFlags.length; // how many executions have a flags row
+  const missingFlags = totalExec - flagCoverage; // executions with no flags row at all
+
   // Metrics cards
   document.getElementById('sw-metrics').innerHTML = [
     { label:'Total conversations', val: totalExec.toLocaleString(), cls:'blue', sub:'chat-bot sessions · in period' },
-    { label:'Classification rate', val: totalExec ? fmt((swCounts.used_classification/totalExec)*100)+'%' : '—', cls:'teal', sub:'of total conversations' },
+    { label:'Classification rate', val: totalExec ? fmt((swCounts.used_classification/totalExec)*100)+'%' : '—', cls:'teal',
+      sub: `${swCounts.used_classification} / ${totalExec}${missingFlags > 0 ? ` · ⚠ ${missingFlags} exec without flags` : ''}` },
     { label:'Escalation to staff', val: swCounts.used_summary||0, cls:'amber', sub:'reached summary' },
   ].map(m => `<div class="metric-card ${m.cls}"><div class="metric-label">${m.label}</div><div class="metric-value ${m.cls}">${m.val}</div><div class="metric-sub">${m.sub}</div></div>`).join('');
 
@@ -1278,13 +1288,31 @@ async function loadGuardrails(since) {
 async function loadRouting(since) {
   const { data: rawRows } = await sb.from('execution_log')
     .select('execution_id,route_to,started_at,need_staff_contact,status,reply_type,session_id')
-    .gte('started_at', since);
+    .gte('started_at', since)
+    .order('started_at', { ascending: false })
+    .limit(10000);
   if (!rawRows) return;
 
   const rows = [...new Map(rawRows.filter(r => !!r.session_id).map(r => [r.execution_id, r])).values()];
   const total = rows.length;
+  const execIds = rows.map(r => r.execution_id);
+
+  // Fetch classification flags to identify bypassed conversations
+  const { data: flagRows } = execIds.length
+    ? await sb.from('workflow_agent_flags').select('execution_id,used_classification').in('execution_id', execIds)
+    : { data: [] };
+  const classifiedSet = new Set((flagRows||[]).filter(r => r.used_classification).map(r => r.execution_id));
+  const classifiedCount = classifiedSet.size;
+  const bypassCount = total - classifiedCount;
+
   const cnts = {advisor:0,education:0,summary:0,unknown:0};
   rows.forEach(r => { const k = r.route_to||'unknown'; if (cnts[k]!==undefined) cnts[k]++; else cnts.unknown++; });
+
+  // Split Summary and Unknown by whether classification ran
+  const classifiedSummary = rows.filter(r => r.route_to === 'summary' && classifiedSet.has(r.execution_id)).length;
+  const bypassSummary     = cnts.summary - classifiedSummary;   // JSON offerCard direct-to-summary
+  const classifiedUnknown = rows.filter(r => (r.route_to === 'unknown' || !r.route_to) && classifiedSet.has(r.execution_id)).length;
+  const blockUnknown      = cnts.unknown - classifiedUnknown;   // guardrail-blocked / no route set
 
   ['adv','edu','sum','unk'].forEach((k,i) => {
     const key = ['advisor','education','summary','unknown'][i];
@@ -1292,6 +1320,11 @@ async function loadRouting(since) {
     document.getElementById('rt-'+k).textContent = cnt.toLocaleString();
     document.getElementById('rt-'+k+'-pct').textContent = total ? fmt((cnt/total)*100)+'% of conversations' : '—';
   });
+  // Annotate sub-labels to show the split
+  document.getElementById('rt-sum-pct').textContent =
+    `${classifiedSummary} via classification · ${bypassSummary} direct bypass`;
+  document.getElementById('rt-unk-pct').textContent =
+    `${classifiedUnknown} classified unknown · ${blockUnknown} guardrail blocked`;
   document.getElementById('rt-total').textContent = total;
 
   // Donut
@@ -1326,6 +1359,11 @@ async function loadRouting(since) {
   document.getElementById('rt-escl-pct').textContent = total ? fmt((escl/total)*100)+'% of turns' : '—';
   document.getElementById('rt-escl-rate').textContent = total ? fmt((escl/total)*100)+'%' : '—';
   document.getElementById('rt-confirmed').textContent = confirmed;
+
+  // Bypass metric — bypassSummary = JSON offerCard direct-to-summary; blockUnknown = guardrail-blocked
+  document.getElementById('rt-bypass').textContent = bypassCount;
+  document.getElementById('rt-bypass-sub').textContent =
+    `${bypassSummary} direct→summary · ${blockUnknown} guardrail blocked`;
 }
 
 // ── ERRORS ────────────────────────────────────────────────────────────────────
@@ -1427,7 +1465,7 @@ async function loadSessions(since) {
 
   // Pull per-execution costs and sum into sessions
   const { data: costRows } = await sb.from('agent_call_log')
-    .select('execution_id,total_cost_thb,total_tokens').gte('started_at', since);
+    .select('execution_id,total_cost_thb,total_tokens').gte('started_at', since).limit(10000);
   const execSessMap = {};
   uniqueRows.forEach(r => { if (r.session_id) execSessMap[r.execution_id] = r.session_id; });
   (costRows||[]).forEach(r => {
@@ -1532,7 +1570,8 @@ async function loadLogs(since) {
       .limit(500),
     sb.from('agent_call_log')
       .select('execution_id,total_tokens,total_cost_thb')
-      .gte('started_at', since),
+      .gte('started_at', since)
+      .limit(10000),
   ]);
 
   logCostMap = {};
