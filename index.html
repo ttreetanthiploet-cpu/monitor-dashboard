@@ -941,16 +941,25 @@ async function loadOverview(since) {
     .order('started_at', { ascending: false });
 
   if (!rows) return;
-  const chatBotRows = rows.filter(r => !!r.session_id);
+  const uniqueRows = [...new Map(rows.map(r => [r.execution_id, r])).values()];
+  const chatBotRows = uniqueRows.filter(r => !!r.session_id);
   const total = chatBotRows.length;
   const success = chatBotRows.filter(r => r.status === 'success').length;
   const rate = total ? ((success/total)*100).toFixed(1)+'%' : '—';
   const avgMs = total ? Math.round(chatBotRows.reduce((s,r)=>s+(r.wall_time_ms||0),0)/total) : 0;
 
-  // Fetch total cost from agent_call_log
-  const { data: costRows } = await sb.from('agent_call_log').select('total_cost_thb,started_at').gte('started_at', since);
-  const totalCostThb = (costRows||[]).reduce((s,r)=>s+(r.total_cost_thb||0),0);
+  // Fetch agent_call_log once for cost, latency, and per-execution token lookup
+  const { data: ovAgentRows } = await sb.from('agent_call_log').select('execution_id,workflow_name,processing_time_ms,total_tokens,total_cost_thb,started_at').gte('started_at', since);
+  const totalCostThb = (ovAgentRows||[]).reduce((s,r)=>s+(r.total_cost_thb||0),0);
   const totalCostUsd = totalCostThb / 36.5;
+
+  // Build per-execution token + cost map for the table
+  const ovExecMap = {};
+  (ovAgentRows||[]).forEach(r => {
+    if (!ovExecMap[r.execution_id]) ovExecMap[r.execution_id] = { tokens: 0, cost: 0 };
+    ovExecMap[r.execution_id].tokens += (r.total_tokens||0);
+    ovExecMap[r.execution_id].cost   += (r.total_cost_thb||0);
+  });
 
   document.getElementById('ov-total').textContent = total.toLocaleString();
   document.getElementById('ov-total-sub').textContent = `chat-bot sessions · last ${activeDays} day(s)`;
@@ -975,10 +984,8 @@ async function loadOverview(since) {
   });
 
   // Latency bars by agent workflow
-  const { data: agentRows } = await sb.from('agent_call_log')
-    .select('workflow_name,processing_time_ms').gte('started_at', since);
   const wfLat = {};
-  (agentRows||[]).forEach(r => {
+  (ovAgentRows||[]).forEach(r => {
     if (!wfLat[r.workflow_name]) wfLat[r.workflow_name] = [];
     wfLat[r.workflow_name].push(r.processing_time_ms||0);
   });
@@ -991,16 +998,15 @@ async function loadOverview(since) {
 
   // Recent executions table (chat-bot only)
   document.getElementById('ov-table').innerHTML = chatBotRows.slice(0,20).map(r => {
-    // Fetch token sum per execution inline isn't possible here without N+1 — show from pre-joined data
     const msg = (r.user_message||'').slice(0,40) + ((r.user_message||'').length > 40 ? '…' : '');
-    const t = r.started_at ? new Date(r.started_at).toLocaleTimeString() : '—';
+    const em = ovExecMap[r.execution_id];
     return `<tr class="row-clickable" onclick="openDrawer('${r.execution_id}')">
       <td class="td-mono">${escHtml((r.session_id||'—').slice(-8))}</td>
       <td class="td-mono">${escHtml((r.customer_id||'—').slice(-8))}</td>
       <td style="max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--text2)">${escHtml(msg)}</td>
       <td>${routeBadge(r.route_to)}</td>
       <td>${fmtMs(r.wall_time_ms)}</td>
-      <td>—</td>
+      <td>${em ? fmtK(em.tokens) : '—'}</td>
       <td>${statusBadge(r.status)}</td>
     </tr>`;
   }).join('') || '<tr><td colspan="7" style="color:var(--text3);padding:16px 0">No data for this period</td></tr>';
@@ -1089,24 +1095,33 @@ async function loadAI(since) {
   const agentMap = {};
   rows.forEach(r => {
     const a = r.agent_name||'unknown';
-    if (!agentMap[a]) agentMap[a] = {workflow:r.workflow_name||'—',calls:0,inp:0,out:0,cost:0,lat:0};
+    if (!agentMap[a]) agentMap[a] = {workflow:r.workflow_name||'—',calls:0,inp:0,out:0,total:0,inpNull:0,cost:0,lat:0};
     agentMap[a].calls++;
     agentMap[a].inp   += (r.input_tokens||0);
     agentMap[a].out   += (r.output_tokens||0);
+    agentMap[a].total += (r.total_tokens||0);
+    if (r.input_tokens == null) agentMap[a].inpNull++;
     agentMap[a].cost  += (r.total_cost_thb||0);
     agentMap[a].lat   += (r.processing_time_ms||0);
   });
   document.getElementById('ai-agent-table').innerHTML = Object.entries(agentMap)
     .sort((a,b)=>b[1].cost-a[1].cost)
-    .map(([name,v]) => `<tr>
+    .map(([name,v]) => {
+      const allInpNull = v.inpNull === v.calls;
+      const inpCell = allInpNull
+        ? `<span style="color:var(--text3)" title="input_tokens not logged — showing total">${fmtK(Math.round(v.total/v.calls))} <span style="font-size:10px">(total)</span></span>`
+        : fmtK(Math.round(v.inp/v.calls));
+      const outCell = allInpNull ? '<span style="color:var(--text3)">—</span>' : fmtK(Math.round(v.out/v.calls));
+      return `<tr>
       <td style="font-weight:500">${escHtml(name)}</td>
       <td class="td-mono" style="font-size:11px">${escHtml(v.workflow)}</td>
       <td>${v.calls.toLocaleString()}</td>
-      <td class="td-right">${fmtK(Math.round(v.inp/v.calls))}</td>
-      <td class="td-right">${fmtK(Math.round(v.out/v.calls))}</td>
+      <td class="td-right">${inpCell}</td>
+      <td class="td-right">${outCell}</td>
       <td class="td-right">${fmtThb(v.cost/v.calls)}</td>
       <td class="td-right">${fmtMs(Math.round(v.lat/v.calls))}</td>
-    </tr>`).join('') || '<tr><td colspan="7" style="color:var(--text3)">No data</td></tr>';
+    </tr>`;
+    }).join('') || '<tr><td colspan="7" style="color:var(--text3)">No data</td></tr>';
 }
 
 // ── SUB-WORKFLOWS ─────────────────────────────────────────────────────────────
@@ -1115,7 +1130,8 @@ async function loadSubworkflows(since) {
   const { data: execRows } = await sb.from('execution_log').select('execution_id,session_id,started_at').gte('started_at', since);
   const { data: agentRowsRaw } = await sb.from('agent_call_log').select('execution_id,workflow_name,processing_time_ms,total_tokens,total_cost_thb,started_at').gte('started_at', since);
 
-  const chatBotExecRows = (execRows||[]).filter(r => !!r.session_id);
+  const uniqueExecRows = [...new Map((execRows||[]).map(r => [r.execution_id, r])).values()];
+  const chatBotExecRows = uniqueExecRows.filter(r => !!r.session_id);
   const totalExec = chatBotExecRows.length;
   const execIds = new Set(chatBotExecRows.map(r => r.execution_id));
   const agentRows = (agentRowsRaw||[]).filter(r => execIds.has(r.execution_id));
@@ -1265,7 +1281,7 @@ async function loadRouting(since) {
     .gte('started_at', since);
   if (!rawRows) return;
 
-  const rows = rawRows.filter(r => !!r.session_id);
+  const rows = [...new Map(rawRows.filter(r => !!r.session_id).map(r => [r.execution_id, r])).values()];
   const total = rows.length;
   const cnts = {advisor:0,education:0,summary:0,unknown:0};
   rows.forEach(r => { const k = r.route_to||'unknown'; if (cnts[k]!==undefined) cnts[k]++; else cnts.unknown++; });
@@ -1391,9 +1407,12 @@ async function loadSessions(since) {
     allSessions = []; return;
   }
 
+  // Deduplicate by execution_id before grouping so turns can't be inflated
+  const uniqueRows = [...new Map(rows.map(r => [r.execution_id, r])).values()];
+
   // Group by session_id
   const sessionMap = {};
-  rows.forEach(r => {
+  uniqueRows.forEach(r => {
     if (!r.session_id) return;
     if (!sessionMap[r.session_id]) {
       sessionMap[r.session_id] = { session_id:r.session_id, customer_id:r.customer_id||'—', turns:0, routes:{advisor:0,education:0,summary:0,unknown:0}, first:r.started_at, last:r.started_at, lastStatus:r.status, totalCost:0, totalTokens:0, execIds:[] };
@@ -1410,7 +1429,7 @@ async function loadSessions(since) {
   const { data: costRows } = await sb.from('agent_call_log')
     .select('execution_id,total_cost_thb,total_tokens').gte('started_at', since);
   const execSessMap = {};
-  rows.forEach(r => { if (r.session_id) execSessMap[r.execution_id] = r.session_id; });
+  uniqueRows.forEach(r => { if (r.session_id) execSessMap[r.execution_id] = r.session_id; });
   (costRows||[]).forEach(r => {
     const sid = execSessMap[r.execution_id];
     if (sid && sessionMap[sid]) {
