@@ -834,6 +834,7 @@ let logPageNum = 1;
 const LOG_PAGE_SIZE = 50;
 let allLogs = [];
 let allSessions = [];
+let logCostMap = {};
 let charts = {};
 
 // ── Supabase connect ──────────────────────────────────────────────────────────
@@ -1504,11 +1505,24 @@ function filterLogsToSession(sessionId) {
 
 // ── LOGS ──────────────────────────────────────────────────────────────────────
 async function loadLogs(since) {
-  const { data: rows } = await sb.from('execution_log')
-    .select('execution_id,session_id,customer_id,started_at,wall_time_ms,route_to,status,user_message')
-    .gte('started_at', since)
-    .order('started_at', { ascending: false })
-    .limit(500);
+  const [{ data: rows }, { data: agentRows }] = await Promise.all([
+    sb.from('execution_log')
+      .select('execution_id,session_id,customer_id,started_at,wall_time_ms,route_to,status,user_message')
+      .gte('started_at', since)
+      .order('started_at', { ascending: false })
+      .limit(500),
+    sb.from('agent_call_log')
+      .select('execution_id,total_tokens,total_cost_thb')
+      .gte('started_at', since),
+  ]);
+
+  logCostMap = {};
+  (agentRows||[]).forEach(r => {
+    if (!logCostMap[r.execution_id]) logCostMap[r.execution_id] = { tokens: 0, cost: 0 };
+    logCostMap[r.execution_id].tokens += (r.total_tokens||0);
+    logCostMap[r.execution_id].cost   += (r.total_cost_thb||0);
+  });
+
   allLogs = rows||[];
   logPageNum = 1;
   renderLogs();
@@ -1544,17 +1558,20 @@ function renderLogs() {
   document.getElementById('log-prev').disabled = logPageNum <= 1;
   document.getElementById('log-next').disabled = logPageNum >= totalPages;
 
-  document.getElementById('log-table').innerHTML = page.map(r => `
+  document.getElementById('log-table').innerHTML = page.map(r => {
+    const cm = logCostMap[r.execution_id];
+    return `
     <tr class="row-clickable" onclick="openDrawer('${r.execution_id}')">
       <td class="td-mono" style="font-size:11px">${r.started_at ? new Date(r.started_at).toLocaleString() : '—'}</td>
       <td class="td-mono">${escHtml((r.session_id||'—').slice(-8))}</td>
       <td class="td-mono">${escHtml((r.customer_id||'—').slice(-8))}</td>
       <td>${routeBadge(r.route_to)}</td>
       <td>${fmtMs(r.wall_time_ms)}</td>
-      <td>—</td>
-      <td>—</td>
+      <td>${cm ? fmtK(cm.tokens) : '—'}</td>
+      <td>${cm ? fmtThb(cm.cost) : '—'}</td>
       <td>${statusBadge(r.status)}</td>
-    </tr>`).join('') || '<tr><td colspan="8" style="color:var(--text3);padding:16px 0">No matching executions</td></tr>';
+    </tr>`;
+  }).join('') || '<tr><td colspan="8" style="color:var(--text3);padding:16px 0">No matching executions</td></tr>';
 }
 
 // ── DRAWER ────────────────────────────────────────────────────────────────────
