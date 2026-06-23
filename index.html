@@ -799,10 +799,12 @@ async function connectSupabase() {
   }
 }
 
-// Auto-connect from localStorage
+// Auto-connect: baked-in Vercel env vars take priority, then localStorage
 window.addEventListener('DOMContentLoaded', () => {
-  const url = localStorage.getItem('sb_url');
-  const key = localStorage.getItem('sb_key');
+  const BAKED_URL = '__SUPABASE_URL__';
+  const BAKED_KEY = '__SUPABASE_ANON_KEY__';
+  const url = BAKED_URL.startsWith('__') ? localStorage.getItem('sb_url') : BAKED_URL;
+  const key = BAKED_KEY.startsWith('__') ? localStorage.getItem('sb_key') : BAKED_KEY;
   if (url && key) {
     document.getElementById('cfgUrl').value = url;
     document.getElementById('cfgKey').value = key;
