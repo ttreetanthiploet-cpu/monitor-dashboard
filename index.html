@@ -698,7 +698,7 @@
       <div class="table-wrap">
         <table>
           <thead><tr>
-            <th>Time</th><th>Session</th><th>Type</th><th>Flag</th><th>Status</th>
+            <th>Time</th><th>Session</th><th>Type</th><th>Flag</th><th>Message</th><th>Status</th>
           </tr></thead>
           <tbody id="gr-table"></tbody>
         </table>
@@ -921,8 +921,33 @@ function fmtMs(ms) { if (!ms) return '—'; return ms >= 1000 ? (ms/1000).toFixe
 function fmtThb(n) { if (n == null) return '—'; return '฿'+Number(n).toFixed(4); }
 function escHtml(s) { return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
 function routeBadge(r) {
+  const norm = (r||'').toLowerCase();
   const m = {advisor:'badge-blue',education:'badge-teal',summary:'badge-purple',unknown:'badge-amber'};
-  return `<span class="badge ${m[r]||'badge-neutral'}">${escHtml(r||'—')}</span>`;
+  return `<span class="badge ${m[norm]||'badge-neutral'}">${escHtml(r||'—')}</span>`;
+}
+// Join agent_call_log → execution_log by time window (execution_ids are different n8n sub-executions)
+function buildExecCostMap(execRows, agentRows) {
+  console.log('[MAP] execRows:', (execRows||[]).length, 'agentRows:', (agentRows||[]).length);
+  const wins = (execRows||[]).map(r => ({
+    eid: r.execution_id,
+    start: new Date(r.started_at).getTime(),
+    end: new Date(r.started_at).getTime() + (r.wall_time_ms || 120000),
+  })).sort((a,b) => a.start - b.start);
+  const map = {};
+  for (const ar of (agentRows||[])) {
+    const t = new Date(ar.started_at).getTime();
+    for (const w of wins) {
+      if (w.start > t) break;
+      if (t <= w.end) {
+        if (!map[w.eid]) map[w.eid] = {tokens:0, cost:0};
+        map[w.eid].tokens += (ar.total_tokens||0);
+        map[w.eid].cost   += (ar.total_cost_thb||0);
+        break;
+      }
+    }
+  }
+  console.log('[MAP] result keys:', Object.keys(map).length, 'sample:', Object.entries(map).slice(0,2));
+  return map;
 }
 function statusBadge(s) {
   const m = {success:'badge-green',error:'badge-red',guardrail_blocked:'badge-amber'};
@@ -954,17 +979,12 @@ async function loadOverview(since) {
   const avgMs = total ? Math.round(chatBotRows.reduce((s,r)=>s+(r.wall_time_ms||0),0)/total) : 0;
 
   // Fetch agent_call_log once for cost, latency, and per-execution token lookup
-  const { data: ovAgentRows } = await sb.from('agent_call_log').select('execution_id,workflow_name,processing_time_ms,total_tokens,total_cost_thb,started_at').gte('started_at', since).limit(10000);
+  const { data: ovAgentRows } = await sb.from('agent_call_log').select('execution_id,workflow_name,processing_time_ms,total_tokens,total_cost_thb,total_cost_usd,started_at').gte('started_at', since).limit(10000);
   const totalCostThb = (ovAgentRows||[]).reduce((s,r)=>s+(r.total_cost_thb||0),0);
-  const totalCostUsd = totalCostThb / 36.5;
+  const totalCostUsd = (ovAgentRows||[]).reduce((s,r)=>s+(r.total_cost_usd||0),0);
 
-  // Build per-execution token + cost map for the table
-  const ovExecMap = {};
-  (ovAgentRows||[]).forEach(r => {
-    if (!ovExecMap[r.execution_id]) ovExecMap[r.execution_id] = { tokens: 0, cost: 0 };
-    ovExecMap[r.execution_id].tokens += (r.total_tokens||0);
-    ovExecMap[r.execution_id].cost   += (r.total_cost_thb||0);
-  });
+  // Build per-execution token + cost map using time-window join (sub-workflow IDs ≠ main exec IDs)
+  const ovExecMap = buildExecCostMap(chatBotRows, ovAgentRows);
 
   document.getElementById('ov-total').textContent = total.toLocaleString();
   document.getElementById('ov-total-sub').textContent = `chat-bot sessions · last ${activeDays} day(s)`;
@@ -1033,27 +1053,35 @@ async function loadAI(since) {
   const totalInpCostUsd = rows.reduce((s,r)=>s+(r.input_cost_usd||0),0);
   const totalOutCostUsd = rows.reduce((s,r)=>s+(r.output_cost_usd||0),0);
 
+  const thbRate = totalCostUsd > 0 ? totalCostThb / totalCostUsd : 33;
   document.getElementById('ai-calls').textContent = totalCalls.toLocaleString();
   document.getElementById('ai-inp-tok').textContent = fmtK(totalInp);
-  document.getElementById('ai-inp-cost').textContent = '฿'+fmt(totalInpCostUsd*36.5,4)+' input cost';
+  document.getElementById('ai-inp-cost').textContent = '฿'+fmt(totalInpCostUsd*thbRate,4)+' input cost';
   document.getElementById('ai-out-tok').textContent = fmtK(totalOut);
-  document.getElementById('ai-out-cost').textContent = '฿'+fmt(totalOutCostUsd*36.5,4)+' output cost';
+  document.getElementById('ai-out-cost').textContent = '฿'+fmt(totalOutCostUsd*thbRate,4)+' output cost';
   document.getElementById('ai-cost-thb').textContent = fmtThb(totalCostThb);
   document.getElementById('ai-cost-usd').textContent = '$'+fmt(totalCostUsd,4)+' USD';
 
-  // Avg cost per LLM call by route
+  // Avg cost per LLM call by route — time-window join (sub-workflow IDs ≠ main exec IDs)
   const { data: execRows } = await sb.from('execution_log')
-    .select('execution_id,route_to,workflow_id').gte('started_at', since).limit(10000);
+    .select('execution_id,route_to,workflow_id,started_at,wall_time_ms')
+    .eq('workflow_id', MAIN_WF_ID).gte('started_at', since).limit(10000);
+  const execCostMap = buildExecCostMap(execRows||[], rows);
+  // Build route lookup from execCostMap back to route_to
   const execRouteMap = {};
-  (execRows||[]).forEach(r => { execRouteMap[r.execution_id] = r.route_to; });
-  const mappedRoutes = {};
-  rows.forEach(r => { const rt = execRouteMap[r.execution_id]||'__unmapped__'; mappedRoutes[rt]=(mappedRoutes[rt]||0)+1; });
-  console.log('[AI] agent_call_log rows:', rows.length, '| execution_log rows:', (execRows||[]).length, '| route distribution:', mappedRoutes);
+  (execRows||[]).forEach(r => { execRouteMap[r.execution_id] = (r.route_to||'unknown').toLowerCase(); });
 
   const routeCost = { all:{sum:0,cnt:0}, advisor:{sum:0,cnt:0}, education:{sum:0,cnt:0}, summary:{sum:0,cnt:0} };
   rows.forEach(r => {
     const cost = r.total_cost_thb||0;
-    const route = execRouteMap[r.execution_id] || 'unknown';
+    // Find which main execution's window this agent call fell into
+    const t = new Date(r.started_at).getTime();
+    let route = 'unknown';
+    for (const e of (execRows||[])) {
+      const s = new Date(e.started_at).getTime();
+      if (s > t) continue;
+      if (t <= s + (e.wall_time_ms||120000)) { route = (e.route_to||'unknown').toLowerCase(); break; }
+    }
     routeCost.all.sum += cost; routeCost.all.cnt++;
     if (routeCost[route]) { routeCost[route].sum += cost; routeCost[route].cnt++; }
   });
@@ -1130,19 +1158,15 @@ async function loadAI(since) {
 
 // ── SUB-WORKFLOWS ─────────────────────────────────────────────────────────────
 async function loadSubworkflows(since) {
-  const { data: execRows } = await sb.from('execution_log').select('execution_id,session_id,workflow_id,started_at').gte('started_at', since).order('started_at', { ascending: false }).limit(10000);
+  const { data: execRows } = await sb.from('execution_log').select('execution_id,session_id,workflow_id,started_at,wall_time_ms').gte('started_at', since).order('started_at', { ascending: false }).limit(10000);
   const { data: agentRowsRaw } = await sb.from('agent_call_log').select('execution_id,workflow_name,processing_time_ms,total_tokens,total_cost_thb,started_at').gte('started_at', since).limit(10000);
 
   const uniqueExecRows = [...new Map((execRows||[]).map(r => [r.execution_id, r])).values()];
   const chatBotExecRows = uniqueExecRows.filter(r => r.workflow_id === MAIN_WF_ID);
   const totalExec = chatBotExecRows.length;
   const execIds = new Set(chatBotExecRows.map(r => r.execution_id));
-  const agentRows = (agentRowsRaw||[]).filter(r => execIds.has(r.execution_id));
-  const wfNamesRaw = [...new Set((agentRowsRaw||[]).map(r=>r.workflow_name))];
-  const wfNamesFiltered = [...new Set(agentRows.map(r=>r.workflow_name))];
-  console.log('[SW] execIds:', execIds.size, '| agentRowsRaw:', (agentRowsRaw||[]).length, '→ agentRows after filter:', agentRows.length);
-  console.log('[SW] workflow_names in raw:', wfNamesRaw);
-  console.log('[SW] workflow_names after execId filter:', wfNamesFiltered);
+  // agent_call_log execution_ids are sub-workflow IDs — not filterable by execIds
+  const agentRows = agentRowsRaw||[];
 
   const { data: flagRows } = await sb.from('workflow_agent_flags')
     .select('*')
@@ -1180,14 +1204,33 @@ async function loadSubworkflows(since) {
     return `<div class="prog-row"><span class="prog-label">${s.label}</span><div class="prog-bg"><div class="prog-fill" style="width:${pct}%;background:${s.color}"></div></div><span class="prog-val">${pct}%</span></div>`;
   }).join('');
 
-  // Latency by workflow
-  const wfLat = {};
-  (agentRows||[]).forEach(r => {
-    if (!wfLat[r.workflow_name]) wfLat[r.workflow_name] = [];
-    wfLat[r.workflow_name].push(r.processing_time_ms||0);
+  // Latency by workflow — sum LLM call times per (main exec, workflow), then average across execs
+  const execWins = chatBotExecRows.map(r => ({
+    eid: r.execution_id,
+    start: new Date(r.started_at).getTime(),
+    end: new Date(r.started_at).getTime() + (r.wall_time_ms || 120000),
+  })).sort((a,b) => a.start - b.start);
+  const execWfLat = {};
+  for (const ar of (agentRows||[])) {
+    const t = new Date(ar.started_at).getTime();
+    for (const w of execWins) {
+      if (w.start > t) break;
+      if (t <= w.end) {
+        if (!execWfLat[w.eid]) execWfLat[w.eid] = {};
+        execWfLat[w.eid][ar.workflow_name] = (execWfLat[w.eid][ar.workflow_name]||0) + (ar.processing_time_ms||0);
+        break;
+      }
+    }
+  }
+  const wfLatSums = {};
+  Object.values(execWfLat).forEach(wfMap => {
+    Object.entries(wfMap).forEach(([wn, ms]) => {
+      if (!wfLatSums[wn]) wfLatSums[wn] = [];
+      wfLatSums[wn].push(ms);
+    });
   });
-  const wfLabels = Object.keys(wfLat);
-  const wfAvgs = wfLabels.map(w => Math.round(wfLat[w].reduce((a,b)=>a+b,0)/wfLat[w].length));
+  const wfLabels = Object.keys(wfLatSums);
+  const wfAvgs = wfLabels.map(w => Math.round(wfLatSums[w].reduce((a,b)=>a+b,0)/wfLatSums[w].length));
   mkChart('sw-chart-latency', {
     type:'bar',
     data:{ labels:wfLabels, datasets:[{ data:wfAvgs, backgroundColor:CHART_COLORS.slice(0,wfLabels.length), borderRadius:4 }] },
@@ -1202,7 +1245,7 @@ async function loadSubworkflows(since) {
     wfTok[r.workflow_name]  += (r.total_tokens||0);
   });
   // Map workflow_name → flag key
-  const wfFlagMap = { 'Intent_classification':'used_classification', 'AdvisorWorkFlow_v1.3':'used_advisor', 'Education_v1.3':'used_education', 'Summary_Workflow':'used_summary', 'output_Guardrail':'used_output_guardrail', 'input_Guardrail':'used_input_guardrail' };
+  const wfFlagMap = { 'Intent_classification':'used_classification', 'AdvisorWorkFlow_v1.3':'used_advisor', 'Education v1.3':'used_education', 'Summary Workflow':'used_summary', 'output Guardrail':'used_output_guardrail', 'Input Guardrail':'used_input_guardrail' };
 
   document.getElementById('sw-table').innerHTML = SW.map(s => {
     const cnt = swCounts[s.key]||0;
@@ -1212,7 +1255,8 @@ async function loadSubworkflows(since) {
     const calls = (agentRows||[]).filter(r=>r.workflow_name===wfName).length;
     const avgTok = calls ? Math.round((wfTok[wfName]||0)/calls) : 0;
     const avgCost = calls ? (wfCost[wfName]||0)/calls : 0;
-    const avgLat = calls ? Math.round((wfLat[wfName]||[]).reduce((a,b)=>a+b,0)/calls) : 0;
+    const latArr = wfLatSums[wfName]||[];
+    const avgLat = latArr.length ? Math.round(latArr.reduce((a,b)=>a+b,0)/latArr.length) : 0;
     return `<tr>
       <td style="font-weight:500">${s.label}</td>
       <td class="td-right">${cnt.toLocaleString()}</td>
@@ -1227,8 +1271,9 @@ async function loadSubworkflows(since) {
 // ── GUARDRAILS ────────────────────────────────────────────────────────────────
 async function loadGuardrails(since) {
   const { data: rows } = await sb.from('execution_log')
-    .select('execution_id,session_id,started_at,input_guardrail_triggered,output_guardrail_triggered,output_guardrail_nsfw,output_guardrail_hallucination,status')
-    .gte('started_at', since);
+    .select('execution_id,session_id,started_at,input_guardrail_triggered,output_guardrail_triggered,output_guardrail_nsfw,output_guardrail_hallucination,status,user_message,ai_reply')
+    .gte('started_at', since)
+    .limit(10000);
   if (!rows) return;
 
   const total = rows.length;
@@ -1276,18 +1321,22 @@ async function loadGuardrails(since) {
   document.getElementById('gr-legend').innerHTML = donutLabels.map((l,i)=>`<div class="legend-item"><div class="legend-dot" style="background:${donutColors[i]}"></div>${l}: ${donutData[i]}</div>`).join('');
 
   // Table
-  const events = rows.filter(r=>r.input_guardrail_triggered||r.output_guardrail_triggered).slice(0,20);
+  const events = rows.filter(r=>r.input_guardrail_triggered||r.output_guardrail_triggered).slice(0,50);
   document.getElementById('gr-table').innerHTML = events.map(r => {
-    const type = r.input_guardrail_triggered ? 'Input' : 'Output';
+    const isInp = r.input_guardrail_triggered;
+    const type = isInp ? 'Input' : 'Output';
     const flag = r.output_guardrail_nsfw ? '<span class="badge badge-purple">nsfw</span>' : r.output_guardrail_hallucination ? '<span class="badge badge-amber">hallucination</span>' : '<span class="badge badge-red">blocked</span>';
     const t = r.started_at ? new Date(r.started_at).toLocaleString() : '—';
+    const msgRaw = isInp ? (r.user_message||'') : (r.ai_reply||'');
+    const msg = msgRaw.length > 60 ? escHtml(msgRaw.slice(0,60))+'…' : escHtml(msgRaw);
     return `<tr>
       <td class="td-mono" style="font-size:11px">${t}</td>
       <td class="td-mono">${escHtml((r.session_id||'—').slice(-8))}</td>
       <td>${type}</td><td>${flag}</td>
+      <td style="max-width:220px;font-size:12px;color:var(--text2)" title="${escHtml(msgRaw)}">${msg||'—'}</td>
       <td>${statusBadge(r.status)}</td>
     </tr>`;
-  }).join('') || '<tr><td colspan="5" style="color:var(--text3);padding:12px 0">No guardrail events in this period</td></tr>';
+  }).join('') || '<tr><td colspan="6" style="color:var(--text3);padding:12px 0">No guardrail events in this period</td></tr>';
 }
 
 // ── ROUTING ───────────────────────────────────────────────────────────────────
@@ -1312,13 +1361,13 @@ async function loadRouting(since) {
   const bypassCount = total - classifiedCount;
 
   const cnts = {advisor:0,education:0,summary:0,unknown:0};
-  rows.forEach(r => { const k = r.route_to||'unknown'; if (cnts[k]!==undefined) cnts[k]++; else cnts.unknown++; });
+  rows.forEach(r => { const k = (r.route_to||'unknown').toLowerCase(); if (cnts[k]!==undefined) cnts[k]++; else cnts.unknown++; });
 
   // Split Summary and Unknown by whether classification ran
-  const classifiedSummary = rows.filter(r => r.route_to === 'summary' && classifiedSet.has(r.execution_id)).length;
-  const bypassSummary     = cnts.summary - classifiedSummary;   // JSON offerCard direct-to-summary
-  const classifiedUnknown = rows.filter(r => (r.route_to === 'unknown' || !r.route_to) && classifiedSet.has(r.execution_id)).length;
-  const blockUnknown      = cnts.unknown - classifiedUnknown;   // guardrail-blocked / no route set
+  const classifiedSummary = rows.filter(r => (r.route_to||'').toLowerCase() === 'summary' && classifiedSet.has(r.execution_id)).length;
+  const bypassSummary     = cnts.summary - classifiedSummary;
+  const classifiedUnknown = rows.filter(r => ((r.route_to||'unknown').toLowerCase() === 'unknown' || !r.route_to) && classifiedSet.has(r.execution_id)).length;
+  const blockUnknown      = cnts.unknown - classifiedUnknown;
 
   ['adv','edu','sum','unk'].forEach((k,i) => {
     const key = ['advisor','education','summary','unknown'][i];
@@ -1349,7 +1398,7 @@ async function loadRouting(since) {
   rows.forEach(r => {
     const d = r.started_at ? r.started_at.slice(0,10) : 'x';
     if (!byDay[d]) byDay[d] = {advisor:0,education:0,summary:0,unknown:0};
-    const k = r.route_to||'unknown'; if (byDay[d][k]!==undefined) byDay[d][k]++;
+    const k = (r.route_to||'unknown').toLowerCase(); if (byDay[d][k]!==undefined) byDay[d][k]++;
   });
   const days4 = Object.keys(byDay).sort();
   mkChart('rt-chart-trend', {
@@ -1360,7 +1409,7 @@ async function loadRouting(since) {
 
   // Escalation
   const escl = rows.filter(r=>r.need_staff_contact).length;
-  const confirmed = rows.filter(r=>r.route_to==='summary').length;
+  const confirmed = rows.filter(r=>(r.route_to||'').toLowerCase()==='summary').length;
   document.getElementById('rt-escl').textContent = escl;
   document.getElementById('rt-escl-pct').textContent = total ? fmt((escl/total)*100)+'% of turns' : '—';
   document.getElementById('rt-escl-rate').textContent = total ? fmt((escl/total)*100)+'%' : '—';
@@ -1463,23 +1512,20 @@ async function loadSessions(since) {
     }
     const s = sessionMap[r.session_id];
     s.turns++;
-    const route = r.route_to||'unknown';
+    const route = (r.route_to||'unknown').toLowerCase();
     s.routes[route] = (s.routes[route]||0) + 1;
     if (r.started_at > s.last) { s.last = r.started_at; s.lastStatus = r.status; }
     s.execIds.push(r.execution_id);
   });
 
-  // Pull per-execution costs and sum into sessions
+  // Pull per-execution costs using time-window join (sub-workflow IDs ≠ main exec IDs)
   const { data: costRows } = await sb.from('agent_call_log')
-    .select('execution_id,total_cost_thb,total_tokens').gte('started_at', since).limit(10000);
-  const execSessMap = {};
-  uniqueRows.forEach(r => { if (r.session_id) execSessMap[r.execution_id] = r.session_id; });
-  (costRows||[]).forEach(r => {
-    const sid = execSessMap[r.execution_id];
-    if (sid && sessionMap[sid]) {
-      sessionMap[sid].totalCost   += (r.total_cost_thb||0);
-      sessionMap[sid].totalTokens += (r.total_tokens||0);
-    }
+    .select('execution_id,started_at,total_cost_thb,total_tokens').gte('started_at', since).limit(10000);
+  const execCostMap = buildExecCostMap(uniqueRows, costRows);
+  uniqueRows.forEach(r => {
+    if (!r.session_id || !sessionMap[r.session_id]) return;
+    const ec = execCostMap[r.execution_id];
+    if (ec) { sessionMap[r.session_id].totalCost += ec.cost; sessionMap[r.session_id].totalTokens += ec.tokens; }
   });
 
   allSessions = Object.values(sessionMap).sort((a,b) => new Date(b.last) - new Date(a.last));
@@ -1575,17 +1621,12 @@ async function loadLogs(since) {
       .order('started_at', { ascending: false })
       .limit(500),
     sb.from('agent_call_log')
-      .select('execution_id,total_tokens,total_cost_thb')
+      .select('execution_id,started_at,total_tokens,total_cost_thb')
       .gte('started_at', since)
       .limit(10000),
   ]);
 
-  logCostMap = {};
-  (agentRows||[]).forEach(r => {
-    if (!logCostMap[r.execution_id]) logCostMap[r.execution_id] = { tokens: 0, cost: 0 };
-    logCostMap[r.execution_id].tokens += (r.total_tokens||0);
-    logCostMap[r.execution_id].cost   += (r.total_cost_thb||0);
-  });
+  logCostMap = buildExecCostMap(rows||[], agentRows||[]);
 
   allLogs = rows||[];
   logPageNum = 1;
