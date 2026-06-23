@@ -925,28 +925,47 @@ function routeBadge(r) {
   const m = {advisor:'badge-blue',education:'badge-teal',summary:'badge-purple',unknown:'badge-amber'};
   return `<span class="badge ${m[norm]||'badge-neutral'}">${escHtml(r||'—')}</span>`;
 }
-// Join agent_call_log → execution_log by time window (execution_ids are different n8n sub-executions)
+// Join agent_call_log → execution_log.
+// Strategy 1 (preferred): direct execution_id match — works when n8n logs agent calls under the
+//   parent workflow's execution ID (which the drawer already relies on).
+// Strategy 2 (fallback): time-window join — for agent rows whose execution_id is a
+//   sub-execution ID that differs from the parent.
 function buildExecCostMap(execRows, agentRows) {
-  console.log('[MAP] execRows:', (execRows||[]).length, 'agentRows:', (agentRows||[]).length);
-  const wins = (execRows||[]).map(r => ({
-    eid: r.execution_id,
-    start: new Date(r.started_at).getTime(),
-    end: new Date(r.started_at).getTime() + (r.wall_time_ms || 120000),
-  })).sort((a,b) => a.start - b.start);
   const map = {};
+  const execIdSet = new Set((execRows||[]).map(r => r.execution_id));
+
+  // Pass 1 — direct match
+  const unmatched = [];
   for (const ar of (agentRows||[])) {
-    const t = new Date(ar.started_at).getTime();
-    for (const w of wins) {
-      if (w.start > t) break;
-      if (t <= w.end) {
-        if (!map[w.eid]) map[w.eid] = {tokens:0, cost:0};
-        map[w.eid].tokens += (ar.total_tokens||0);
-        map[w.eid].cost   += (ar.total_cost_thb||0);
-        break;
+    if (execIdSet.has(ar.execution_id)) {
+      if (!map[ar.execution_id]) map[ar.execution_id] = {tokens:0, cost:0};
+      map[ar.execution_id].tokens += (ar.total_tokens||0);
+      map[ar.execution_id].cost   += (ar.total_cost_thb||0);
+    } else {
+      unmatched.push(ar);
+    }
+  }
+
+  // Pass 2 — time-window join for agent rows that didn't directly match
+  if (unmatched.length) {
+    const wins = (execRows||[]).map(r => ({
+      eid: r.execution_id,
+      start: new Date(r.started_at).getTime(),
+      end: new Date(r.started_at).getTime() + (r.wall_time_ms || 120000) + 60000,
+    })).sort((a,b) => a.start - b.start);
+    for (const ar of unmatched) {
+      const t = new Date(ar.started_at).getTime();
+      for (const w of wins) {
+        if (w.start > t) break;
+        if (t <= w.end) {
+          if (!map[w.eid]) map[w.eid] = {tokens:0, cost:0};
+          map[w.eid].tokens += (ar.total_tokens||0);
+          map[w.eid].cost   += (ar.total_cost_thb||0);
+          break;
+        }
       }
     }
   }
-  console.log('[MAP] result keys:', Object.keys(map).length, 'sample:', Object.entries(map).slice(0,2));
   return map;
 }
 function statusBadge(s) {
@@ -955,6 +974,21 @@ function statusBadge(s) {
 }
 function destroyChart(id) { if (charts[id]) { charts[id].destroy(); delete charts[id]; } }
 function mkChart(id, cfg) { destroyChart(id); const el = document.getElementById(id); if (!el) return; charts[id] = new Chart(el, cfg); }
+
+// Supabase .in() silently fails when the URL gets too long (>~8KB, ~200+ UUIDs).
+// This helper batches the query into chunks of 100 to stay safe.
+async function fetchFlagsInChunks(execIdArray, columns) {
+  if (!execIdArray.length) return [];
+  const CHUNK = 100;
+  const results = [];
+  for (let i = 0; i < execIdArray.length; i += CHUNK) {
+    const { data } = await sb.from('workflow_agent_flags')
+      .select(columns)
+      .in('execution_id', execIdArray.slice(i, i + CHUNK));
+    if (data) results.push(...data);
+  }
+  return results;
+}
 
 const CHART_COLORS = ['#4f8ef7','#34c77b','#f59e0b','#f05252','#2dd4bf','#a78bfa','#fb923c'];
 const baseOpts = {
@@ -972,7 +1006,8 @@ async function loadOverview(since) {
 
   if (!rows) return;
   const uniqueRows = [...new Map(rows.map(r => [r.execution_id, r])).values()];
-  const chatBotRows = uniqueRows.filter(r => r.workflow_id === MAIN_WF_ID);
+  const chatBotRows = uniqueRows.filter(r => r.workflow_id === MAIN_WF_ID)
+    .sort((a, b) => new Date(b.started_at) - new Date(a.started_at));
   const total = chatBotRows.length;
   const success = chatBotRows.filter(r => r.status === 'success').length;
   const rate = total ? ((success/total)*100).toFixed(1)+'%' : '—';
@@ -1080,7 +1115,7 @@ async function loadAI(since) {
     for (const e of (execRows||[])) {
       const s = new Date(e.started_at).getTime();
       if (s > t) continue;
-      if (t <= s + (e.wall_time_ms||120000)) { route = (e.route_to||'unknown').toLowerCase(); break; }
+      if (t <= s + (e.wall_time_ms||120000) + 60000) { route = (e.route_to||'unknown').toLowerCase(); break; }
     }
     routeCost.all.sum += cost; routeCost.all.cnt++;
     if (routeCost[route]) { routeCost[route].sum += cost; routeCost[route].cnt++; }
@@ -1158,7 +1193,7 @@ async function loadAI(since) {
 
 // ── SUB-WORKFLOWS ─────────────────────────────────────────────────────────────
 async function loadSubworkflows(since) {
-  const { data: execRows } = await sb.from('execution_log').select('execution_id,session_id,workflow_id,started_at,wall_time_ms').gte('started_at', since).order('started_at', { ascending: false }).limit(10000);
+  const { data: execRows } = await sb.from('execution_log').select('execution_id,session_id,workflow_id,started_at,wall_time_ms,route_to,output_guardrail_triggered').gte('started_at', since).order('started_at', { ascending: false }).limit(10000);
   const { data: agentRowsRaw } = await sb.from('agent_call_log').select('execution_id,workflow_name,processing_time_ms,total_tokens,total_cost_thb,started_at').gte('started_at', since).limit(10000);
 
   const uniqueExecRows = [...new Map((execRows||[]).map(r => [r.execution_id, r])).values()];
@@ -1168,10 +1203,23 @@ async function loadSubworkflows(since) {
   // agent_call_log execution_ids are sub-workflow IDs — not filterable by execIds
   const agentRows = agentRowsRaw||[];
 
-  const { data: flagRows } = await sb.from('workflow_agent_flags')
-    .select('*')
-    .in('execution_id', [...execIds]);
-  const relevantFlags = flagRows||[];
+  const rawFlags = await fetchFlagsInChunks([...execIds], '*');
+
+  // Supplement missing flags from execution_log.route_to.
+  // workflow_agent_flags may not set used_advisor/education/summary even when those
+  // sub-workflows ran — route_to in execution_log is the reliable source for those.
+  const flagsById = {};
+  rawFlags.forEach(f => { flagsById[f.execution_id] = {...f}; });
+  chatBotExecRows.forEach(r => {
+    if (!flagsById[r.execution_id]) flagsById[r.execution_id] = { execution_id: r.execution_id };
+    const route = (r.route_to||'').toLowerCase();
+    if (route === 'advisor')   flagsById[r.execution_id].used_advisor   = true;
+    if (route === 'education') flagsById[r.execution_id].used_education = true;
+    if (route === 'summary')   flagsById[r.execution_id].used_summary   = true;
+    // output guardrail: infer from output_guardrail_triggered if present
+    if (r.output_guardrail_triggered) flagsById[r.execution_id].used_output_guardrail = true;
+  });
+  const relevantFlags = Object.values(flagsById);
 
   const SW = [
     { key:'used_input_guardrail',  label:'Input guardrail',    color:'#4f8ef7' },
@@ -1186,8 +1234,8 @@ async function loadSubworkflows(since) {
   const swCounts = {};
   SW.forEach(s => { swCounts[s.key] = relevantFlags.filter(r => r[s.key]).length; });
 
-  const flagCoverage = relevantFlags.length; // how many executions have a flags row
-  const missingFlags = totalExec - flagCoverage; // executions with no flags row at all
+  const flagCoverage = rawFlags.length; // executions that have an actual workflow_agent_flags row
+  const missingFlags = totalExec - flagCoverage; // executions supplemented from route_to only
 
   // Metrics cards
   document.getElementById('sw-metrics').innerHTML = [
@@ -1208,7 +1256,7 @@ async function loadSubworkflows(since) {
   const execWins = chatBotExecRows.map(r => ({
     eid: r.execution_id,
     start: new Date(r.started_at).getTime(),
-    end: new Date(r.started_at).getTime() + (r.wall_time_ms || 120000),
+    end: new Date(r.started_at).getTime() + (r.wall_time_ms || 120000) + 60000,
   })).sort((a,b) => a.start - b.start);
   const execWfLat = {};
   for (const ar of (agentRows||[])) {
@@ -1217,7 +1265,8 @@ async function loadSubworkflows(since) {
       if (w.start > t) break;
       if (t <= w.end) {
         if (!execWfLat[w.eid]) execWfLat[w.eid] = {};
-        execWfLat[w.eid][ar.workflow_name] = (execWfLat[w.eid][ar.workflow_name]||0) + (ar.processing_time_ms||0);
+        const wn = (ar.workflow_name||'').toLowerCase();
+        execWfLat[w.eid][wn] = (execWfLat[w.eid][wn]||0) + (ar.processing_time_ms||0);
         break;
       }
     }
@@ -1240,19 +1289,20 @@ async function loadSubworkflows(since) {
   // Table
   const wfCost = {}, wfTok = {};
   (agentRows||[]).forEach(r => {
-    if (!wfCost[r.workflow_name]) { wfCost[r.workflow_name] = 0; wfTok[r.workflow_name] = 0; }
-    wfCost[r.workflow_name] += (r.total_cost_thb||0);
-    wfTok[r.workflow_name]  += (r.total_tokens||0);
+    const wn = (r.workflow_name||'').toLowerCase();
+    if (!wfCost[wn]) { wfCost[wn] = 0; wfTok[wn] = 0; }
+    wfCost[wn] += (r.total_cost_thb||0);
+    wfTok[wn]  += (r.total_tokens||0);
   });
-  // Map workflow_name → flag key
-  const wfFlagMap = { 'Intent_classification':'used_classification', 'AdvisorWorkFlow_v1.3':'used_advisor', 'Education v1.3':'used_education', 'Summary Workflow':'used_summary', 'output Guardrail':'used_output_guardrail', 'Input Guardrail':'used_input_guardrail' };
+  // Map workflow_name (lowercase) → flag key — case-insensitive to match whatever casing the DB stores
+  const wfFlagMap = { 'intent_classification':'used_classification', 'advisorworkflow_v1.3':'used_advisor', 'education v1.3':'used_education', 'summary workflow':'used_summary', 'output guardrail':'used_output_guardrail', 'input guardrail':'used_input_guardrail' };
 
   document.getElementById('sw-table').innerHTML = SW.map(s => {
     const cnt = swCounts[s.key]||0;
     const pct = totalExec ? fmt((cnt/totalExec)*100)+'%' : '—';
     // Find matching workflow
     const wfName = Object.entries(wfFlagMap).find(([,v])=>v===s.key)?.[0]||'—';
-    const calls = (agentRows||[]).filter(r=>r.workflow_name===wfName).length;
+    const calls = (agentRows||[]).filter(r=>(r.workflow_name||'').toLowerCase()===wfName).length;
     const avgTok = calls ? Math.round((wfTok[wfName]||0)/calls) : 0;
     const avgCost = calls ? (wfCost[wfName]||0)/calls : 0;
     const latArr = wfLatSums[wfName]||[];
@@ -1352,11 +1402,9 @@ async function loadRouting(since) {
   const total = rows.length;
   const execIds = rows.map(r => r.execution_id);
 
-  // Fetch classification flags to identify bypassed conversations
-  const { data: flagRows } = execIds.length
-    ? await sb.from('workflow_agent_flags').select('execution_id,used_classification').in('execution_id', execIds)
-    : { data: [] };
-  const classifiedSet = new Set((flagRows||[]).filter(r => r.used_classification).map(r => r.execution_id));
+  // Fetch classification flags to identify bypassed conversations (chunked to avoid URL length limit)
+  const flagRows = await fetchFlagsInChunks(execIds, 'execution_id,used_classification');
+  const classifiedSet = new Set(flagRows.filter(r => r.used_classification).map(r => r.execution_id));
   const classifiedCount = classifiedSet.size;
   const bypassCount = total - classifiedCount;
 
@@ -1619,7 +1667,7 @@ async function loadLogs(since) {
       .select('execution_id,session_id,customer_id,started_at,wall_time_ms,route_to,status,user_message,workflow_id')
       .gte('started_at', since)
       .order('started_at', { ascending: false })
-      .limit(500),
+      .limit(10000),
     sb.from('agent_call_log')
       .select('execution_id,started_at,total_tokens,total_cost_thb')
       .gte('started_at', since)
@@ -1650,7 +1698,7 @@ function renderLogs() {
 
   let filtered = allLogs;
   if (search)  filtered = filtered.filter(r => (r.session_id||'').toLowerCase().includes(search) || (r.customer_id||'').toLowerCase().includes(search));
-  if (route)   filtered = filtered.filter(r => r.route_to === route);
+  if (route)   filtered = filtered.filter(r => (r.route_to||'').toLowerCase() === route);
   if (status === 'chat-bot')   filtered = filtered.filter(r => r.workflow_id === MAIN_WF_ID);
   else if (status === 'no-session') filtered = filtered.filter(r => r.workflow_id !== MAIN_WF_ID);
   else if (status) filtered = filtered.filter(r => r.status === status);
