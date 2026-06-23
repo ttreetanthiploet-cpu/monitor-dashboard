@@ -460,6 +460,10 @@
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="9"/><rect x="14" y="3" width="7" height="5"/><rect x="14" y="12" width="7" height="9"/><rect x="3" y="16" width="7" height="5"/></svg>
     Overview
   </button>
+  <button class="tab-btn" data-tab="sessions" onclick="switchTab('sessions')">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 21v-2a4 4 0 00-4-4H5a4 4 0 00-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 00-3-3.87"/><path d="M16 3.13a4 4 0 010 7.75"/></svg>
+    Sessions
+  </button>
   <button class="tab-btn" data-tab="ai" onclick="switchTab('ai')">
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2a5 5 0 015 5v3a5 5 0 01-10 0V7a5 5 0 015-5z"/><path d="M15 17h1a4 4 0 014 4H4a4 4 0 014-4h1"/></svg>
     AI performance
@@ -528,6 +532,54 @@
             <th>Route</th><th>Wall time</th><th>Tokens</th><th>Status</th>
           </tr></thead>
           <tbody id="ov-table"></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── TAB: SESSIONS ────────────────────────────────── -->
+  <div class="tab-panel" id="tab-sessions">
+    <div class="section-label">Conversation sessions</div>
+    <div class="metric-grid metric-grid-4" style="margin-bottom:24px">
+      <div class="metric-card blue"><div class="metric-label">Total sessions</div><div class="metric-value blue" id="sess-total">—</div><div class="metric-sub" id="sess-total-sub">in period</div></div>
+      <div class="metric-card teal"><div class="metric-label">Avg turns / session</div><div class="metric-value teal" id="sess-avg-turns">—</div><div class="metric-sub">messages per chat</div></div>
+      <div class="metric-card amber"><div class="metric-label">Avg cost / session</div><div class="metric-value amber" id="sess-avg-cost">—</div><div class="metric-sub">THB</div></div>
+      <div class="metric-card green"><div class="metric-label">Avg session duration</div><div class="metric-value green" id="sess-avg-duration">—</div><div class="metric-sub">first to last turn</div></div>
+    </div>
+
+    <div class="row2">
+      <div class="card">
+        <div class="card-title">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M3 9h18M9 21V9"/></svg>
+          Sessions over time
+        </div>
+        <div class="chart-box"><canvas id="sess-chart-volume"></canvas></div>
+      </div>
+      <div class="card">
+        <div class="card-title">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="22,12 18,12 15,21 9,3 6,12 2,12"/></svg>
+          Turns per session
+        </div>
+        <div id="sess-turns-bars" style="padding-top:4px"></div>
+      </div>
+    </div>
+
+    <div class="card" style="margin-bottom:0">
+      <div class="card-title" style="justify-content:space-between;align-items:center">
+        <span style="display:flex;align-items:center;gap:8px">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:15px;height:15px"><path d="M17 21v-2a4 4 0 00-4-4H5a4 4 0 00-4 4v2"/><circle cx="9" cy="7" r="4"/></svg>
+          Session list
+        </span>
+        <input class="search-input" id="sess-search" placeholder="Search session or customer ID…" oninput="renderSessions()" style="width:220px;font-size:12px;padding:5px 10px" />
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead><tr>
+            <th>Session ID</th><th>Customer</th><th class="td-right">Turns</th>
+            <th>First seen</th><th>Last seen</th><th>Duration</th>
+            <th>Routes</th><th class="td-right">Cost (THB)</th><th>Last status</th>
+          </tr></thead>
+          <tbody id="sess-table"></tbody>
         </table>
       </div>
     </div>
@@ -735,7 +787,9 @@
         <option value="unknown">Unknown</option>
       </select>
       <select class="select-filter" id="log-status-filter" onchange="filterLogs()">
-        <option value="">All statuses</option>
+        <option value="chat-bot" selected>Chat-bot (has session)</option>
+        <option value="">All</option>
+        <option value="no-session">No session</option>
         <option value="success">Success</option>
         <option value="guardrail_blocked">Guardrail blocked</option>
         <option value="error">Error</option>
@@ -779,6 +833,7 @@ let activeDays = 7;
 let logPageNum = 1;
 const LOG_PAGE_SIZE = 50;
 let allLogs = [];
+let allSessions = [];
 let charts = {};
 
 // ── Supabase connect ──────────────────────────────────────────────────────────
@@ -839,6 +894,7 @@ async function loadAll() {
   try {
     await Promise.all([
       loadOverview(since),
+      loadSessions(since),
       loadAI(since),
       loadSubworkflows(since),
       loadGuardrails(since),
@@ -854,6 +910,7 @@ async function loadAll() {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 function fmt(n, dec=1) { if (n == null) return '—'; return Number(n).toFixed(dec); }
+function fmtDuration(ms) { if (!ms || ms < 1000) return '—'; if (ms < 60000) return Math.round(ms/1000)+'s'; if (ms < 3600000) return Math.round(ms/60000)+'m'; return fmt(ms/3600000,1)+'h'; }
 function fmtK(n) { if (n == null) return '—'; return n >= 1000 ? (n/1000).toFixed(1)+'K' : String(n); }
 function fmtMs(ms) { if (!ms) return '—'; return ms >= 1000 ? (ms/1000).toFixed(1)+'s' : ms+'ms'; }
 function fmtThb(n) { if (n == null) return '—'; return '฿'+Number(n).toFixed(4); }
@@ -883,10 +940,11 @@ async function loadOverview(since) {
     .order('started_at', { ascending: false });
 
   if (!rows) return;
-  const total = rows.length;
-  const success = rows.filter(r => r.status === 'success').length;
+  const chatBotRows = rows.filter(r => !!r.session_id);
+  const total = chatBotRows.length;
+  const success = chatBotRows.filter(r => r.status === 'success').length;
   const rate = total ? ((success/total)*100).toFixed(1)+'%' : '—';
-  const avgMs = total ? Math.round(rows.reduce((s,r)=>s+(r.wall_time_ms||0),0)/total) : 0;
+  const avgMs = total ? Math.round(chatBotRows.reduce((s,r)=>s+(r.wall_time_ms||0),0)/total) : 0;
 
   // Fetch total cost from agent_call_log
   const { data: costRows } = await sb.from('agent_call_log').select('total_cost_thb,started_at').gte('started_at', since);
@@ -894,17 +952,17 @@ async function loadOverview(since) {
   const totalCostUsd = totalCostThb / 36.5;
 
   document.getElementById('ov-total').textContent = total.toLocaleString();
-  document.getElementById('ov-total-sub').textContent = `last ${activeDays} day(s)`;
+  document.getElementById('ov-total-sub').textContent = `chat-bot sessions · last ${activeDays} day(s)`;
   document.getElementById('ov-success').textContent = rate;
   document.getElementById('ov-success-sub').textContent = (total-success)+' errors / guardrail blocks';
   document.getElementById('ov-latency').textContent = fmtMs(avgMs);
-  document.getElementById('ov-latency-sub').textContent = 'wall time average';
+  document.getElementById('ov-latency-sub').textContent = 'chat-bot sessions avg';
   document.getElementById('ov-cost').textContent = fmtThb(totalCostThb);
   document.getElementById('ov-cost-sub').textContent = '$'+fmt(totalCostUsd,4)+' USD';
 
-  // Volume chart — group by day
+  // Volume chart — group by day (chat-bot only)
   const byDay = {};
-  rows.forEach(r => {
+  chatBotRows.forEach(r => {
     const d = r.started_at ? r.started_at.slice(0,10) : 'unknown';
     byDay[d] = (byDay[d]||0) + 1;
   });
@@ -930,8 +988,8 @@ async function loadOverview(since) {
     return `<div class="prog-row"><span class="prog-label">${escHtml(wf)}</span><div class="prog-bg"><div class="prog-fill" style="width:${pct}%;background:var(--accent)"></div></div><span class="prog-val">${fmtMs(Math.round(avg))}</span></div>`;
   }).join('') || '<div style="color:var(--text3);font-size:13px;padding:8px 0">No agent data yet</div>';
 
-  // Recent executions table
-  document.getElementById('ov-table').innerHTML = rows.slice(0,20).map(r => {
+  // Recent executions table (chat-bot only)
+  document.getElementById('ov-table').innerHTML = chatBotRows.slice(0,20).map(r => {
     // Fetch token sum per execution inline isn't possible here without N+1 — show from pre-joined data
     const msg = (r.user_message||'').slice(0,40) + ((r.user_message||'').length > 40 ? '…' : '');
     const t = r.started_at ? new Date(r.started_at).toLocaleTimeString() : '—';
@@ -1053,11 +1111,13 @@ async function loadAI(since) {
 // ── SUB-WORKFLOWS ─────────────────────────────────────────────────────────────
 async function loadSubworkflows(since) {
   const { data: flagRows } = await sb.from('workflow_agent_flags').select('*');
-  const { data: execRows } = await sb.from('execution_log').select('execution_id,started_at').gte('started_at', since);
-  const { data: agentRows } = await sb.from('agent_call_log').select('workflow_name,processing_time_ms,total_tokens,total_cost_thb,started_at').gte('started_at', since);
+  const { data: execRows } = await sb.from('execution_log').select('execution_id,session_id,started_at').gte('started_at', since);
+  const { data: agentRowsRaw } = await sb.from('agent_call_log').select('execution_id,workflow_name,processing_time_ms,total_tokens,total_cost_thb,started_at').gte('started_at', since);
 
-  const totalExec = (execRows||[]).length;
-  const execIds = new Set((execRows||[]).map(r => r.execution_id));
+  const chatBotExecRows = (execRows||[]).filter(r => !!r.session_id);
+  const totalExec = chatBotExecRows.length;
+  const execIds = new Set(chatBotExecRows.map(r => r.execution_id));
+  const agentRows = (agentRowsRaw||[]).filter(r => execIds.has(r.execution_id));
   const relevantFlags = (flagRows||[]).filter(r => execIds.has(r.execution_id));
 
   const SW = [
@@ -1075,8 +1135,8 @@ async function loadSubworkflows(since) {
 
   // Metrics cards
   document.getElementById('sw-metrics').innerHTML = [
-    { label:'Total conversations', val: totalExec.toLocaleString(), cls:'blue', sub:'in period' },
-    { label:'Classification rate', val: totalExec ? fmt((swCounts.used_classification/totalExec)*100)+'%' : '—', cls:'teal', sub:'intent classified' },
+    { label:'Total conversations', val: totalExec.toLocaleString(), cls:'blue', sub:'chat-bot sessions · in period' },
+    { label:'Classification rate', val: totalExec ? fmt((swCounts.used_classification/totalExec)*100)+'%' : '—', cls:'teal', sub:'of total conversations' },
     { label:'Escalation to staff', val: swCounts.used_summary||0, cls:'amber', sub:'reached summary' },
   ].map(m => `<div class="metric-card ${m.cls}"><div class="metric-label">${m.label}</div><div class="metric-value ${m.cls}">${m.val}</div><div class="metric-sub">${m.sub}</div></div>`).join('');
 
@@ -1199,11 +1259,12 @@ async function loadGuardrails(since) {
 
 // ── ROUTING ───────────────────────────────────────────────────────────────────
 async function loadRouting(since) {
-  const { data: rows } = await sb.from('execution_log')
-    .select('execution_id,route_to,started_at,need_staff_contact,status,reply_type')
+  const { data: rawRows } = await sb.from('execution_log')
+    .select('execution_id,route_to,started_at,need_staff_contact,status,reply_type,session_id')
     .gte('started_at', since);
-  if (!rows) return;
+  if (!rawRows) return;
 
+  const rows = rawRows.filter(r => !!r.session_id);
   const total = rows.length;
   const cnts = {advisor:0,education:0,summary:0,unknown:0};
   rows.forEach(r => { const k = r.route_to||'unknown'; if (cnts[k]!==undefined) cnts[k]++; else cnts.unknown++; });
@@ -1315,6 +1376,132 @@ async function loadErrors(since) {
   }).join('') || '<tr><td colspan="5" style="color:var(--text3);padding:12px 0">No errors in this period 🎉</td></tr>';
 }
 
+// ── SESSIONS ──────────────────────────────────────────────────────────────────
+async function loadSessions(since) {
+  const { data: rows } = await sb.from('execution_log')
+    .select('execution_id,session_id,customer_id,started_at,wall_time_ms,route_to,status')
+    .gte('started_at', since)
+    .not('session_id', 'is', null)
+    .order('started_at', { ascending: true });
+
+  if (!rows || !rows.length) {
+    ['sess-total','sess-avg-turns','sess-avg-cost','sess-avg-duration'].forEach(id => { const el=document.getElementById(id); if(el) el.textContent='—'; });
+    document.getElementById('sess-table').innerHTML = '<tr><td colspan="9" style="color:var(--text3);padding:16px 0">No sessions in this period</td></tr>';
+    allSessions = []; return;
+  }
+
+  // Group by session_id
+  const sessionMap = {};
+  rows.forEach(r => {
+    if (!r.session_id) return;
+    if (!sessionMap[r.session_id]) {
+      sessionMap[r.session_id] = { session_id:r.session_id, customer_id:r.customer_id||'—', turns:0, routes:{advisor:0,education:0,summary:0,unknown:0}, first:r.started_at, last:r.started_at, lastStatus:r.status, totalCost:0, totalTokens:0, execIds:[] };
+    }
+    const s = sessionMap[r.session_id];
+    s.turns++;
+    const route = r.route_to||'unknown';
+    s.routes[route] = (s.routes[route]||0) + 1;
+    if (r.started_at > s.last) { s.last = r.started_at; s.lastStatus = r.status; }
+    s.execIds.push(r.execution_id);
+  });
+
+  // Pull per-execution costs and sum into sessions
+  const { data: costRows } = await sb.from('agent_call_log')
+    .select('execution_id,total_cost_thb,total_tokens').gte('started_at', since);
+  const execSessMap = {};
+  rows.forEach(r => { if (r.session_id) execSessMap[r.execution_id] = r.session_id; });
+  (costRows||[]).forEach(r => {
+    const sid = execSessMap[r.execution_id];
+    if (sid && sessionMap[sid]) {
+      sessionMap[sid].totalCost   += (r.total_cost_thb||0);
+      sessionMap[sid].totalTokens += (r.total_tokens||0);
+    }
+  });
+
+  allSessions = Object.values(sessionMap).sort((a,b) => new Date(b.last) - new Date(a.last));
+
+  const totalSess = allSessions.length;
+  const avgTurns  = totalSess ? allSessions.reduce((s,r)=>s+r.turns,0)/totalSess : 0;
+  const avgCost   = totalSess ? allSessions.reduce((s,r)=>s+r.totalCost,0)/totalSess : 0;
+  const avgDurMs  = totalSess ? allSessions.reduce((s,r)=>s+(new Date(r.last)-new Date(r.first)),0)/totalSess : 0;
+
+  document.getElementById('sess-total').textContent = totalSess.toLocaleString();
+  document.getElementById('sess-total-sub').textContent = `last ${activeDays} day(s)`;
+  document.getElementById('sess-avg-turns').textContent = fmt(avgTurns, 1);
+  document.getElementById('sess-avg-cost').textContent = fmtThb(avgCost);
+  document.getElementById('sess-avg-duration').textContent = fmtDuration(avgDurMs);
+
+  // Sessions by day chart
+  const byDay = {};
+  allSessions.forEach(s => { const d = s.first?s.first.slice(0,10):'x'; byDay[d]=(byDay[d]||0)+1; });
+  const days = Object.keys(byDay).sort();
+  mkChart('sess-chart-volume', {
+    type:'bar',
+    data:{ labels:days, datasets:[{ data:days.map(d=>byDay[d]), backgroundColor:'#4f8ef7', borderRadius:3 }] },
+    options:{ ...baseOpts }
+  });
+
+  // Turns-per-session distribution bars
+  const bucketLabels = ['1 turn','2–3','4–5','6–10','10+'];
+  const buckets = [0,0,0,0,0];
+  allSessions.forEach(s => {
+    if (s.turns===1) buckets[0]++;
+    else if (s.turns<=3) buckets[1]++;
+    else if (s.turns<=5) buckets[2]++;
+    else if (s.turns<=10) buckets[3]++;
+    else buckets[4]++;
+  });
+  const maxB = Math.max(1,...buckets);
+  document.getElementById('sess-turns-bars').innerHTML = bucketLabels
+    .map((l,i) => `<div class="prog-row"><span class="prog-label">${l}</span><div class="prog-bg"><div class="prog-fill" style="width:${Math.round((buckets[i]/maxB)*100)}%;background:var(--teal)"></div></div><span class="prog-val">${buckets[i]}</span></div>`)
+    .join('');
+
+  renderSessions();
+}
+
+function renderSessions() {
+  const search = (document.getElementById('sess-search')?.value||'').toLowerCase();
+  const filtered = search ? allSessions.filter(s =>
+    (s.session_id||'').toLowerCase().includes(search) || (s.customer_id||'').toLowerCase().includes(search)
+  ) : allSessions;
+
+  const routeColors = { advisor:'#4f8ef7', education:'#2dd4bf', summary:'#a78bfa', unknown:'#f59e0b' };
+
+  document.getElementById('sess-table').innerHTML = filtered.slice(0,100).map(s => {
+    const durMs = s.first && s.last ? new Date(s.last)-new Date(s.first) : 0;
+    const first = s.first ? new Date(s.first).toLocaleString() : '—';
+    const last  = s.last  ? new Date(s.last).toLocaleString()  : '—';
+    const routeLabels = { advisor:'Advisor', education:'Education', summary:'Summary', unknown:'Unknown' };
+    const routeDots = Object.entries(s.routes)
+      .filter(([,cnt])=>cnt>0)
+      .map(([r,cnt])=>`<span style="display:inline-flex;align-items:center;gap:4px;margin-right:8px;font-size:11px;color:var(--text2);white-space:nowrap"><span style="width:6px;height:6px;border-radius:50%;background:${routeColors[r]||'#888'};flex-shrink:0;display:inline-block"></span>${routeLabels[r]||r} ×${cnt}</span>`)
+      .join('');
+    return `<tr class="row-clickable" onclick="filterLogsToSession('${escHtml(s.session_id)}')">
+      <td class="td-mono" style="font-size:11px" title="${escHtml(s.session_id)}">${escHtml(s.session_id.slice(-12))}</td>
+      <td class="td-mono" style="font-size:11px">${escHtml((s.customer_id||'—').slice(-8))}</td>
+      <td class="td-right" style="font-weight:500">${s.turns}</td>
+      <td class="td-mono" style="font-size:11px">${first}</td>
+      <td class="td-mono" style="font-size:11px">${last}</td>
+      <td>${fmtDuration(durMs)}</td>
+      <td>${routeDots||'—'}</td>
+      <td class="td-right">${s.totalCost ? fmtThb(s.totalCost) : '—'}</td>
+      <td>${statusBadge(s.lastStatus)}</td>
+    </tr>`;
+  }).join('') || '<tr><td colspan="9" style="color:var(--text3);padding:16px 0">No sessions found</td></tr>';
+
+  if (filtered.length > 100) {
+    document.getElementById('sess-table').innerHTML += `<tr><td colspan="9" style="color:var(--text3);font-size:12px;padding:8px 0">${filtered.length-100} more sessions — use search to narrow results</td></tr>`;
+  }
+}
+
+function filterLogsToSession(sessionId) {
+  document.getElementById('log-search').value = sessionId;
+  document.getElementById('log-status-filter').value = '';
+  logPageNum = 1;
+  renderLogs();
+  switchTab('logs');
+}
+
 // ── LOGS ──────────────────────────────────────────────────────────────────────
 async function loadLogs(since) {
   const { data: rows } = await sb.from('execution_log')
@@ -1345,7 +1532,9 @@ function renderLogs() {
   let filtered = allLogs;
   if (search)  filtered = filtered.filter(r => (r.session_id||'').toLowerCase().includes(search) || (r.customer_id||'').toLowerCase().includes(search));
   if (route)   filtered = filtered.filter(r => r.route_to === route);
-  if (status)  filtered = filtered.filter(r => r.status === status);
+  if (status === 'chat-bot')   filtered = filtered.filter(r => !!r.session_id);
+  else if (status === 'no-session') filtered = filtered.filter(r => !r.session_id);
+  else if (status) filtered = filtered.filter(r => r.status === status);
 
   const totalPages = Math.max(1, Math.ceil(filtered.length / LOG_PAGE_SIZE));
   logPageNum = Math.min(logPageNum, totalPages);
