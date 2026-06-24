@@ -136,6 +136,21 @@ async function fetchFlagsInChunks(execIdArray, columns) {
   return results;
 }
 
+// Paginates through all rows matching a query, bypassing Supabase's 1000-row default cap.
+async function fetchAll(queryFn) {
+  const PAGE = 1000;
+  const rows = [];
+  let offset = 0;
+  while (true) {
+    const { data } = await queryFn().range(offset, offset + PAGE - 1);
+    if (!data || !data.length) break;
+    rows.push(...data);
+    if (data.length < PAGE) break;
+    offset += PAGE;
+  }
+  return rows;
+}
+
 // ── Supabase connect + DOMContentLoaded auto-connect ─────────────────────────
 async function connectSupabase() {
   const url = document.getElementById('cfgUrl').value.trim();
@@ -231,12 +246,11 @@ async function loadAll() {
 // ── loadOverview ──────────────────────────────────────────────────────────────
 async function loadOverview(since) {
   // ── 1. Main-workflow executions (conversations) ──────────────────────────────
-  const { data: execRows } = await sb.from('execution_log')
+  const execRows = await fetchAll(() => sb.from('execution_log')
     .select('execution_id,session_id,customer_id,started_at,wall_time_ms,status,route_to,user_message,message_type,workflow_id')
     .gte('started_at', since)
-    .order('started_at', { ascending: false })
-    .limit(10000);
-  if (!execRows) return;
+    .order('started_at', { ascending: false }));
+  if (!execRows.length) return;
 
   // Deduplicate and keep only chat-bot (main WF) rows
   const seen = new Set();
@@ -252,12 +266,10 @@ async function loadOverview(since) {
   const avgWallMs = total ? Math.round(chatBotRows.reduce((s,r) => s + (r.wall_time_ms||0), 0) / total) : 0;
 
   // ── 2. Agent calls — ORDER DESC so newest rows survive the limit ──────────────
-  const { data: agentRows } = await sb.from('agent_call_log')
+  const agentData = await fetchAll(() => sb.from('agent_call_log')
     .select('workflow_name,processing_time_ms,total_cost_thb,total_cost_usd,started_at')
     .gte('started_at', since)
-    .order('started_at', { ascending: false })
-    .limit(10000);
-  const agentData = agentRows || [];
+    .order('started_at', { ascending: false }));
 
   const totalCostThb = agentData.reduce((s,r) => s + (r.total_cost_thb||0), 0);
   const totalCostUsd = agentData.reduce((s,r) => s + (r.total_cost_usd||0), 0);
@@ -328,12 +340,11 @@ async function loadSessions(since) {
   };
 
   // Step 1 — aggregate agent_call_log by execution_id (sum procMs + cost)
-  const { data: agentRows } = await sb.from('agent_call_log')
+  const agentRows = await fetchAll(() => sb.from('agent_call_log')
     .select('execution_id,processing_time_ms,total_cost_thb')
     .gte('started_at', since)
-    .order('started_at', { ascending: false })
-    .limit(10000);
-  if (!agentRows || !agentRows.length) { emptyState('No agent call data in this period'); renderSessions(); return; }
+    .order('started_at', { ascending: false }));
+  if (!agentRows.length) { emptyState('No agent call data in this period'); renderSessions(); return; }
 
   const agentByExec = {};
   agentRows.forEach(r => {
@@ -472,12 +483,11 @@ function filterLogsToSession(sessionId) {
 // ── loadAI ────────────────────────────────────────────────────────────────────
 async function loadAI(since) {
   // Fetch ALL agent calls in the period — ORDER DESC so newest rows survive the limit
-  const { data: rows } = await sb.from('agent_call_log')
+  const rows = await fetchAll(() => sb.from('agent_call_log')
     .select('agent_name,workflow_name,input_tokens,output_tokens,total_tokens,total_cost_thb,input_cost_usd,output_cost_usd,total_cost_usd,processing_time_ms,started_at')
     .gte('started_at', since)
-    .order('started_at', { ascending: false })
-    .limit(10000);
-  if (!rows || !rows.length) return;
+    .order('started_at', { ascending: false }));
+  if (!rows.length) return;
 
   // ── 1. Summary totals ─────────────────────────────────────────────────────────
   const totalCalls     = rows.length;
@@ -589,19 +599,18 @@ async function loadAI(since) {
 
 // ── loadSubworkflows ──────────────────────────────────────────────────────────
 async function loadSubworkflows(since) {
-  const { data: execRows } = await sb.from('execution_log').select('execution_id,session_id,workflow_id,started_at,wall_time_ms,route_to,output_guardrail_triggered').gte('started_at', since).order('started_at', { ascending: false }).limit(10000);
-  const { data: agentRowsRaw } = await sb.from('agent_call_log')
+  const execRows = await fetchAll(() => sb.from('execution_log').select('execution_id,session_id,workflow_id,started_at,wall_time_ms,route_to,output_guardrail_triggered').gte('started_at', since).order('started_at', { ascending: false }));
+  const agentRowsRaw = await fetchAll(() => sb.from('agent_call_log')
     .select('execution_id,workflow_name,input_tokens,output_tokens,total_tokens,total_cost_thb,processing_time_ms,started_at')
     .gte('started_at', since)
-    .order('started_at', { ascending: false })
-    .limit(10000);
+    .order('started_at', { ascending: false }));
 
   const uniqueExecRows = [...new Map((execRows||[]).map(r => [r.execution_id, r])).values()];
   const chatBotExecRows = uniqueExecRows.filter(r => r.workflow_id === MAIN_WF_ID);
   const totalExec = chatBotExecRows.length;
   const execIds = new Set(chatBotExecRows.map(r => r.execution_id));
   // agent_call_log execution_ids are sub-workflow IDs — not filterable by execIds
-  const agentRows = agentRowsRaw||[];
+  const agentRows = agentRowsRaw;
 
   const rawFlags = await fetchFlagsInChunks([...execIds], '*');
 
@@ -711,11 +720,10 @@ async function loadSubworkflows(since) {
 
 // ── loadGuardrails ────────────────────────────────────────────────────────────
 async function loadGuardrails(since) {
-  const { data: rows } = await sb.from('execution_log')
+  const rows = await fetchAll(() => sb.from('execution_log')
     .select('execution_id,session_id,started_at,input_guardrail_triggered,output_guardrail_triggered,output_guardrail_nsfw,output_guardrail_hallucination,status,user_message,ai_reply')
-    .gte('started_at', since)
-    .limit(10000);
-  if (!rows) return;
+    .gte('started_at', since));
+  if (!rows.length) return;
 
   const total = rows.length;
   const inpBlock = rows.filter(r=>r.input_guardrail_triggered).length;
@@ -782,12 +790,11 @@ async function loadGuardrails(since) {
 
 // ── loadRouting ───────────────────────────────────────────────────────────────
 async function loadRouting(since) {
-  const { data: rawRows } = await sb.from('execution_log')
+  const rawRows = await fetchAll(() => sb.from('execution_log')
     .select('execution_id,route_to,started_at,need_staff_contact,status,reply_type,session_id,workflow_id')
     .gte('started_at', since)
-    .order('started_at', { ascending: false })
-    .limit(10000);
-  if (!rawRows) return;
+    .order('started_at', { ascending: false }));
+  if (!rawRows.length) return;
 
   const rows = [...new Map(rawRows.filter(r => r.workflow_id === MAIN_WF_ID).map(r => [r.execution_id, r])).values()];
   const total = rows.length;
@@ -862,21 +869,21 @@ async function loadRouting(since) {
 
 // ── loadErrors ────────────────────────────────────────────────────────────────
 async function loadErrors(since) {
-  const { data: execErrors } = await sb.from('execution_log')
-    .select('execution_id,session_id,started_at,status,error_message,route_to')
-    .in('status',['error','guardrail_blocked'])
-    .gte('started_at', since);
-
-  const { data: httpErrors } = await sb.from('http_request_log')
-    .select('execution_id,node_name,workflow_name,url,response_status,error_message,started_at,success')
-    .eq('success', false)
-    .gte('started_at', since);
-
-  const { data: allExec } = await sb.from('execution_log').select('id').gte('started_at', since);
-  const total = (allExec||[]).length;
-  const errCount = (execErrors||[]).length;
-  const httpErrCount = (httpErrors||[]).length;
-  const guardrailCount = (execErrors||[]).filter(r=>r.status==='guardrail_blocked').length;
+  const [execErrors, httpErrors, allExec] = await Promise.all([
+    fetchAll(() => sb.from('execution_log')
+      .select('execution_id,session_id,started_at,status,error_message,route_to')
+      .in('status',['error','guardrail_blocked'])
+      .gte('started_at', since)),
+    fetchAll(() => sb.from('http_request_log')
+      .select('execution_id,node_name,workflow_name,url,response_status,error_message,started_at,success')
+      .eq('success', false)
+      .gte('started_at', since)),
+    fetchAll(() => sb.from('execution_log').select('id').gte('started_at', since)),
+  ]);
+  const total = allExec.length;
+  const errCount = execErrors.length;
+  const httpErrCount = httpErrors.length;
+  const guardrailCount = execErrors.filter(r=>r.status==='guardrail_blocked').length;
 
   document.getElementById('er-total').textContent = errCount;
   document.getElementById('er-rate').textContent = total ? fmt((errCount/total)*100,2)+'% error rate' : '—';
@@ -885,7 +892,7 @@ async function loadErrors(since) {
 
   // Error trend — Fix #3: use toLocalDate
   const byDay = {};
-  (execErrors||[]).forEach(r => {
+  execErrors.forEach(r => {
     const d = toLocalDate(r.started_at) || 'x';
     byDay[d] = (byDay[d]||0) + 1;
   });
@@ -909,8 +916,8 @@ async function loadErrors(since) {
 
   // Error table — Fix #4: fmtId for session
   const combinedErrors = [
-    ...(execErrors||[]).map(r=>({ time:r.started_at, session:r.session_id, type: r.status==='guardrail_blocked'?'Guardrail':'Execution error', detail:r.error_message||r.status, node:'—' })),
-    ...(httpErrors||[]).map(r=>({ time:r.started_at, session:r.execution_id, type:'HTTP error', detail:(r.response_status||'timeout')+' '+escHtml(r.url||''), node:r.node_name||'—' })),
+    ...execErrors.map(r=>({ time:r.started_at, session:r.session_id, type: r.status==='guardrail_blocked'?'Guardrail':'Execution error', detail:r.error_message||r.status, node:'—' })),
+    ...httpErrors.map(r=>({ time:r.started_at, session:r.execution_id, type:'HTTP error', detail:(r.response_status||'timeout')+' '+escHtml(r.url||''), node:r.node_name||'—' })),
   ].sort((a,b) => new Date(b.time) - new Date(a.time));
 
   document.getElementById('er-table').innerHTML = combinedErrors.slice(0,50).map(r => {
@@ -927,20 +934,18 @@ async function loadErrors(since) {
 
 // ── loadLogs + renderLogs + filterLogs + logPage ──────────────────────────────
 async function loadLogs(since) {
-  const [{ data: agentRows }, { data: execRows }] = await Promise.all([
-    sb.from('agent_call_log')
+  const [agentRows, execRows] = await Promise.all([
+    fetchAll(() => sb.from('agent_call_log')
       .select('execution_id,agent_name,workflow_name,input_tokens,output_tokens,total_tokens,total_cost_thb,processing_time_ms,started_at')
       .gte('started_at', since)
-      .order('started_at', { ascending: false })
-      .limit(10000),
-    sb.from('execution_log')
+      .order('started_at', { ascending: false })),
+    fetchAll(() => sb.from('execution_log')
       .select('execution_id,session_id,customer_id,route_to,status,workflow_id,started_at,wall_time_ms')
-      .gte('started_at', since)
-      .limit(10000),
+      .gte('started_at', since)),
   ]);
 
   allLogExecMap = {};
-  (execRows||[]).forEach(r => { allLogExecMap[r.execution_id] = r; });
+  execRows.forEach(r => { allLogExecMap[r.execution_id] = r; });
 
   // Build the set of execution_ids that are part of chat-bot conversations.
   // Sub-workflow rows have session_id=null, so we identify them via time-window overlap
@@ -966,7 +971,7 @@ async function loadLogs(since) {
     }
   });
 
-  allLogs = agentRows||[];
+  allLogs = agentRows;
   logPageNum = 1;
   renderLogs();
 }
