@@ -3,7 +3,14 @@
     "allow": [
       "Bash(node -e ' *)",
       "Bash(node --check /Users/tanut/Desktop/work/n8n-dashboard/service.js)",
-      "Bash(awk '/from\\\\\\('\"'\"'agent_call_log'\"'\"'\\\\\\)/{found=1; block=\"\"; line=NR} found{block=block\"\\\\n\"NR\": \"$0} /\\\\.limit\\\\\\(|\\\\.order\\\\\\(/{if\\(found && NR>line\\){print block; found=0}}' /Users/tanut/Desktop/work/n8n-dashboard/service.js)"
+      "Bash(awk '/from\\\\\\('\"'\"'agent_call_log'\"'\"'\\\\\\)/{found=1; block=\"\"; line=NR} found{block=block\"\\\\n\"NR\": \"$0} /\\\\.limit\\\\\\(|\\\\.order\\\\\\(/{if\\(found && NR>line\\){print block; found=0}}' /Users/tanut/Desktop/work/n8n-dashboard/service.js)",
+      "Skill(run)",
+      "Skill(run:*)",
+      "Bash(python3 -m http.server 3001)",
+      "Bash(echo \"Server PID: $!\")",
+      "Bash(curl -s http://localhost:3001/)",
+      "Bash(open -a \"Google Chrome\" http://localhost:3001)",
+      "Bash(open http://localhost:3001)"
     ]
   }
 }
