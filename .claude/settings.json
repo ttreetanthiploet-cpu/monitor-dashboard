@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(node -e ' *)",
+      "Bash(node --check /Users/tanut/Desktop/work/n8n-dashboard/service.js)",
+      "Bash(awk '/from\\\\\\('\"'\"'agent_call_log'\"'\"'\\\\\\)/{found=1; block=\"\"; line=NR} found{block=block\"\\\\n\"NR\": \"$0} /\\\\.limit\\\\\\(|\\\\.order\\\\\\(/{if\\(found && NR>line\\){print block; found=0}}' /Users/tanut/Desktop/work/n8n-dashboard/service.js)"
+    ]
+  }
+}
