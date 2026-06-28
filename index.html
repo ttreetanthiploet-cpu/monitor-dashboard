@@ -4,7 +4,6 @@
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 <title>DebtMind AI Monitor</title>
-<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
 <link rel="preconnect" href="https://fonts.googleapis.com" />
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
@@ -377,57 +376,9 @@
     .date-bar { overflow-x: auto; }
   }
 
-  /* ── Config overlay ── */
-  .config-overlay {
-    display: none; position: fixed; inset: 0;
-    background: rgba(0,0,0,.7); z-index: 300;
-    align-items: center; justify-content: center;
-  }
-  .config-overlay.open { display: flex; }
-  .config-box {
-    background: var(--bg2); border: 1px solid var(--border2);
-    border-radius: var(--radius-lg); padding: 28px 32px;
-    width: 440px; max-width: 95vw;
-  }
-  .config-title { font-size: 16px; font-weight: 600; margin-bottom: 6px; }
-  .config-sub { font-size: 13px; color: var(--text2); margin-bottom: 24px; }
-  .config-field { margin-bottom: 16px; }
-  .config-field label { display: block; font-size: 12px; color: var(--text2); margin-bottom: 5px; }
-  .config-input {
-    width: 100%; background: var(--bg3); border: 1px solid var(--border2);
-    color: var(--text); border-radius: var(--radius);
-    padding: 8px 12px; font-size: 13px; font-family: var(--mono); outline: none;
-  }
-  .config-input:focus { border-color: var(--accent); }
-  .btn-primary {
-    background: var(--accent); color: #fff; border: none;
-    border-radius: var(--radius); padding: 9px 20px;
-    font-size: 13px; font-weight: 600; font-family: var(--font);
-    cursor: pointer; transition: background .15s;
-  }
-  .btn-primary:hover { background: var(--accent2); }
-  .config-error { font-size: 12px; color: var(--red); margin-top: 8px; }
 </style>
 </head>
 <body>
-
-<!-- Config overlay shown on first load -->
-<div class="config-overlay open" id="configOverlay">
-  <div class="config-box">
-    <div class="config-title">Connect to Supabase</div>
-    <div class="config-sub">Enter your project credentials to start monitoring.</div>
-    <div class="config-field">
-      <label>Supabase URL</label>
-      <input class="config-input" id="cfgUrl" type="text" placeholder="https://xxxx.supabase.co" />
-    </div>
-    <div class="config-field">
-      <label>Anon key</label>
-      <input class="config-input" id="cfgKey" type="password" placeholder="eyJhbGciOiJIUzI1NiIsIn..." />
-    </div>
-    <button class="btn-primary" onclick="connectSupabase()">Connect</button>
-    <div class="config-error" id="cfgError"></div>
-  </div>
-</div>
 
 <!-- Topbar -->
 <div class="topbar">

@@ -1,0 +1,17 @@
+[build]
+  publish = "."
+  command = "npm install"
+
+[functions]
+  directory = "netlify/functions"
+  node_bundler = "esbuild"
+
+[[redirects]]
+  from = "/api/data"
+  to = "/.netlify/functions/data"
+  status = 200
+
+[[redirects]]
+  from = "/api/drawer"
+  to = "/.netlify/functions/drawer"
+  status = 200

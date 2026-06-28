@@ -1,18 +1,17 @@
 'use strict';
 
 // ── Constants ─────────────────────────────────────────────────────────────────
-const MAIN_WF_ID = 'CQCLdVdNwrmvI5do'; // Prototype_v1.2 — defines a "conversation"
+const MAIN_WF_ID = 'CQCLdVdNwrmvI5do';
 
 // ── Global state ──────────────────────────────────────────────────────────────
-let sb = null;
-let activeDays = 1;           // Fix #1: default period = Today
+let dashboardData = null;   // cached payload from /api/data
+let activeDays = 1;
 let logPageNum = 1;
 const LOG_PAGE_SIZE = 50;
-let allLogs = [];             // agent_call_log rows
-let allLogExecMap = {};       // execution_id → execution_log row (for session/route/status lookup)
-let allLogChatSet = new Set(); // execution_ids that belong to chat-bot conversations (time-window join)
+let allLogs = [];
+let allLogExecMap = {};
+let allLogChatSet = new Set();
 let allSessions = [];
-let logCostMap = {};
 let charts = {};
 
 // ── Format helpers ────────────────────────────────────────────────────────────
@@ -23,7 +22,6 @@ function fmtMs(ms) { if (!ms) return '—'; return ms >= 1000 ? (ms/1000).toFixe
 function fmtThb(n) { if (n == null) return '—'; return '฿'+Number(n).toFixed(4); }
 function escHtml(s) { return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
 
-// Fix #3: local-date helper — prevents UTC-slice producing 2 bars for midnight-spanning periods
 function toLocalDate(iso) {
   if (!iso) return 'unknown';
   const d = new Date(iso);
@@ -32,11 +30,8 @@ function toLocalDate(iso) {
     String(d.getDate()).padStart(2,'0');
 }
 
-// Fix #4: string-safe ID display
 const fmtId = (v, n=8) => String(v ?? '—').slice(-n);
 
-// Normalize workflow_name variants to a canonical display name via regex.
-// Returns null for blank / unknown so callers can skip those entries.
 function normalizeWfName(raw) {
   if (!raw || /^\s*$/.test(raw) || /^unknown$/i.test(raw.trim())) return null;
   if (/advis/i.test(raw))               return 'Advisor';
@@ -69,190 +64,88 @@ const baseOpts = {
 function destroyChart(id) { if (charts[id]) { charts[id].destroy(); delete charts[id]; } }
 function mkChart(id, cfg) { destroyChart(id); const el = document.getElementById(id); if (!el) return; charts[id] = new Chart(el, cfg); }
 
-// ── Data helpers ──────────────────────────────────────────────────────────────
-
-// Join agent_call_log → execution_log.
-// Strategy 1 (preferred): direct execution_id match — works when n8n logs agent calls under the
-//   parent workflow's execution ID (which the drawer already relies on).
-// Strategy 2 (fallback): time-window join — for agent rows whose execution_id is a
-//   sub-execution ID that differs from the parent.
-function buildExecCostMap(execRows, agentRows) {
-  const map = {};
-  const execIdSet = new Set((execRows||[]).map(r => r.execution_id));
-
-  // Pass 1 — direct match
-  const unmatched = [];
-  for (const ar of (agentRows||[])) {
-    if (execIdSet.has(ar.execution_id)) {
-      if (!map[ar.execution_id]) map[ar.execution_id] = {tokens:0, inp:0, out:0, cost:0};
-      map[ar.execution_id].tokens += (ar.total_tokens||0);
-      map[ar.execution_id].inp   += (ar.input_tokens||0);
-      map[ar.execution_id].out   += (ar.output_tokens||0);
-      map[ar.execution_id].cost  += (ar.total_cost_thb||0);
-    } else {
-      unmatched.push(ar);
-    }
-  }
-
-  // Pass 2 — time-window join. Use the LAST (most recently started) window that still covers
-  // the agent call time, so concurrent sub-executions go to the correct parent.
-  if (unmatched.length) {
-    const wins = (execRows||[]).map(r => ({
-      eid: r.execution_id,
-      start: new Date(r.started_at).getTime(),
-      end: new Date(r.started_at).getTime() + (r.wall_time_ms || 120000) + 60000,
-    })).sort((a,b) => a.start - b.start);
-    for (const ar of unmatched) {
-      const t = new Date(ar.started_at).getTime();
-      let best = null;
-      for (const w of wins) {
-        if (w.start > t) break;
-        if (t <= w.end) best = w;  // keep updating — want the most-recently-started match
-      }
-      if (best) {
-        if (!map[best.eid]) map[best.eid] = {tokens:0, inp:0, out:0, cost:0};
-        map[best.eid].tokens += (ar.total_tokens||0);
-        map[best.eid].inp   += (ar.input_tokens||0);
-        map[best.eid].out   += (ar.output_tokens||0);
-        map[best.eid].cost  += (ar.total_cost_thb||0);
-      }
-    }
-  }
-  return map;
-}
-
-// Supabase .in() silently fails when the URL gets too long (>~8KB, ~200+ UUIDs).
-// This helper batches the query into chunks of 100 to stay safe.
-async function fetchFlagsInChunks(execIdArray, columns) {
-  if (!execIdArray.length) return [];
-  const CHUNK = 100;
-  const results = [];
-  for (let i = 0; i < execIdArray.length; i += CHUNK) {
-    const { data } = await sb.from('workflow_agent_flags')
-      .select(columns)
-      .in('execution_id', execIdArray.slice(i, i + CHUNK));
-    if (data) results.push(...data);
-  }
-  return results;
-}
-
-// Paginates through all rows matching a query, bypassing Supabase's 1000-row default cap.
-async function fetchAll(queryFn) {
-  const PAGE = 1000;
-  const rows = [];
-  let offset = 0;
-  while (true) {
-    const { data } = await queryFn().range(offset, offset + PAGE - 1);
-    if (!data || !data.length) break;
-    rows.push(...data);
-    if (data.length < PAGE) break;
-    offset += PAGE;
-  }
-  return rows;
-}
-
-// ── Supabase connect + DOMContentLoaded auto-connect ─────────────────────────
-async function connectSupabase() {
-  const url = document.getElementById('cfgUrl').value.trim();
-  const key = document.getElementById('cfgKey').value.trim();
-  if (!url || !key) { document.getElementById('cfgError').textContent = 'Both fields are required.'; return; }
-  try {
-    sb = supabase.createClient(url, key);
-    const { error } = await sb.from('execution_log').select('id').limit(1);
-    if (error) throw error;
-    localStorage.setItem('sb_url', url);
-    localStorage.setItem('sb_key', key);
-    document.getElementById('configOverlay').classList.remove('open');
-    await loadAll();
-  } catch (e) {
-    document.getElementById('cfgError').textContent = 'Connection failed: ' + e.message;
-  }
-}
-
-// Auto-connect: baked-in Vercel env vars take priority, then localStorage
-window.addEventListener('DOMContentLoaded', () => {
-  const BAKED_URL = '__SUPABASE_URL__';
-  const BAKED_KEY = '__SUPABASE_ANON_KEY__';
-  const url = BAKED_URL.startsWith('__') ? localStorage.getItem('sb_url') : BAKED_URL;
-  const key = BAKED_KEY.startsWith('__') ? localStorage.getItem('sb_key') : BAKED_KEY;
-  if (url && key) {
-    document.getElementById('cfgUrl').value = url;
-    document.getElementById('cfgKey').value = key;
-    connectSupabase();
-  }
-});
-
 // ── Date range ────────────────────────────────────────────────────────────────
 function setDateRange(days) {
   activeDays = days;
   document.querySelectorAll('.date-pill').forEach(p => p.classList.toggle('active', +p.dataset.days === days));
-  loadAll();
+  if (dashboardData) renderAll();
 }
 
 function getStartDate() {
   const d = new Date();
-  d.setDate(d.getDate() - activeDays + 1); // +1: "7 days" = today + 6 prior days
-  d.setHours(0, 0, 0, 0);                  // anchor to midnight so "Today" = today only
+  d.setDate(d.getDate() - activeDays + 1);
+  d.setHours(0, 0, 0, 0);
   return d.toISOString();
 }
 
 // ── Tab control ───────────────────────────────────────────────────────────────
-
-// Fix #2: switchTab calls _loadTab so navigating to a tab always refreshes its data
 function switchTab(id) {
   document.querySelectorAll('.tab-btn').forEach(b => b.classList.toggle('active', b.dataset.tab === id));
   document.querySelectorAll('.tab-panel').forEach(p => p.classList.toggle('active', p.id === 'tab-' + id));
-  if (sb) _loadTab(id, getStartDate());
+  if (dashboardData) _renderTab(id, getStartDate());
 }
 
-function _loadTab(id, since) {
+function _renderTab(id, since) {
   const tabFns = {
-    overview:     () => loadOverview(since),
-    sessions:     () => loadSessions(since),
-    ai:           () => loadAI(since),
-    subworkflow:  () => loadSubworkflows(since),
-    guardrails:   () => loadGuardrails(since),
-    routing:      () => loadRouting(since),
-    errors:       () => loadErrors(since),
-    logs:         () => loadLogs(since),
+    overview:    () => loadOverview(since),
+    sessions:    () => loadSessions(since),
+    ai:          () => loadAI(since),
+    subworkflow: () => loadSubworkflows(since),
+    guardrails:  () => loadGuardrails(since),
+    routing:     () => loadRouting(since),
+    errors:      () => loadErrors(since),
+    logs:        () => loadLogs(),
   };
-  const fn = tabFns[id];
-  if (fn) fn().catch(e => console.error('[_loadTab]', id, e));
+  try { tabFns[id]?.(); } catch(e) { console.error('[_renderTab]', id, e); }
 }
 
-// ── Load all data ─────────────────────────────────────────────────────────────
+// ── Load all data from API ────────────────────────────────────────────────────
 async function loadAll() {
-  if (!sb) return;
-  const now = new Date().toLocaleTimeString();
-  document.getElementById('syncInfo').textContent = 'Syncing…';
-  const since = getStartDate();
-  const results = await Promise.allSettled([
-    loadOverview(since),
-    loadSessions(since),
-    loadAI(since),
-    loadSubworkflows(since),
-    loadGuardrails(since),
-    loadRouting(since),
-    loadErrors(since),
-    loadLogs(since),
-  ]);
-  const errs = results.filter(r => r.status === 'rejected');
-  errs.forEach(e => console.error('[loadAll]', e.reason));
-  document.getElementById('syncInfo').textContent = errs.length
-    ? `Updated ${now} (${errs.length} tab error(s) — see console)`
-    : 'Updated ' + now;
+  document.getElementById('syncInfo').textContent = 'Loading…';
+  try {
+    const res = await fetch('/api/data');
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}));
+      throw new Error(body.error || res.statusText);
+    }
+    dashboardData = await res.json();
+  } catch (e) {
+    document.getElementById('syncInfo').textContent = 'Error: ' + e.message;
+    console.error('[loadAll]', e);
+    return;
+  }
+  renderAll();
 }
+
+function renderAll() {
+  const since = getStartDate();
+  const now = new Date().toLocaleTimeString();
+  try {
+    loadOverview(since);
+    loadSessions(since);
+    loadAI(since);
+    loadSubworkflows(since);
+    loadGuardrails(since);
+    loadRouting(since);
+    loadErrors(since);
+    loadLogs();
+    const collected = dashboardData.collectedAt
+      ? ' (data from ' + new Date(dashboardData.collectedAt).toLocaleTimeString() + ')'
+      : '';
+    document.getElementById('syncInfo').textContent = 'Refreshed ' + now + collected;
+  } catch (e) {
+    console.error('[renderAll]', e);
+    document.getElementById('syncInfo').textContent = 'Render error — see console';
+  }
+}
+
+window.addEventListener('DOMContentLoaded', () => loadAll());
 
 // ── loadOverview ──────────────────────────────────────────────────────────────
-async function loadOverview(since) {
-  // ── 1. Main-workflow executions (conversations) ──────────────────────────────
-  const execRows = await fetchAll(() => sb.from('execution_log')
-    .select('execution_id,session_id,customer_id,started_at,wall_time_ms,status,route_to,user_message,message_type,workflow_id')
-    .gte('started_at', since)
-    .order('started_at', { ascending: false }));
+function loadOverview(since) {
+  const execRows = (dashboardData.executionLog || []).filter(r => r.started_at >= since);
   if (!execRows.length) return;
 
-  // Deduplicate and keep only chat-bot (main WF) rows
   const seen = new Set();
   const chatBotRows = [];
   for (const r of execRows) {
@@ -265,16 +158,10 @@ async function loadOverview(since) {
   const success = chatBotRows.filter(r => r.status === 'success').length;
   const avgWallMs = total ? Math.round(chatBotRows.reduce((s,r) => s + (r.wall_time_ms||0), 0) / total) : 0;
 
-  // ── 2. Agent calls — ORDER DESC so newest rows survive the limit ──────────────
-  const agentData = await fetchAll(() => sb.from('agent_call_log')
-    .select('workflow_name,processing_time_ms,total_cost_thb,total_cost_usd,started_at')
-    .gte('started_at', since)
-    .order('started_at', { ascending: false }));
-
+  const agentData = (dashboardData.agentCallLog || []).filter(r => r.started_at >= since);
   const totalCostThb = agentData.reduce((s,r) => s + (r.total_cost_thb||0), 0);
   const totalCostUsd = agentData.reduce((s,r) => s + (r.total_cost_usd||0), 0);
 
-  // ── 3. Summary cards ─────────────────────────────────────────────────────────
   document.getElementById('ov-total').textContent     = total.toLocaleString();
   document.getElementById('ov-total-sub').textContent = `chat-bot sessions · last ${activeDays} day(s)`;
   document.getElementById('ov-success').textContent   = total ? ((success/total)*100).toFixed(1)+'%' : '—';
@@ -284,7 +171,6 @@ async function loadOverview(since) {
   document.getElementById('ov-cost').textContent      = fmtThb(totalCostThb);
   document.getElementById('ov-cost-sub').textContent  = '$' + fmt(totalCostUsd, 4) + ' USD (all agent calls in period)';
 
-  // ── 4. Volume chart — conversations per local day ────────────────────────────
   const byDay = {};
   chatBotRows.forEach(r => { const d = toLocalDate(r.started_at); byDay[d] = (byDay[d]||0) + 1; });
   const days = Object.keys(byDay).sort();
@@ -294,7 +180,6 @@ async function loadOverview(since) {
     options: { ...baseOpts },
   });
 
-  // ── 5. Latency bars — avg processing time per sub-workflow (normalized name) ──
   const wfLat = {};
   agentData.forEach(r => {
     const wf = normalizeWfName(r.workflow_name||'') || r.workflow_name || 'unknown';
@@ -310,7 +195,6 @@ async function loadOverview(since) {
       return `<div class="prog-row"><span class="prog-label">${escHtml(wf)}</span><div class="prog-bg"><div class="prog-fill" style="width:${pct}%;background:var(--accent)"></div></div><span class="prog-val">${fmtMs(Math.round(avg))}</span></div>`;
     }).join('') || '<div style="color:var(--text3);font-size:13px;padding:8px 0">No agent data yet</div>';
 
-  // ── 6. Recent executions table (latest 20 chat-bot sessions) ─────────────────
   document.getElementById('ov-table').innerHTML = chatBotRows.slice(0,20).map(r => {
     const msg     = (r.user_message||'').slice(0,40) + ((r.user_message||'').length > 40 ? '…' : '');
     const ts      = r.started_at ? new Date(r.started_at).toLocaleString() : '—';
@@ -329,7 +213,7 @@ async function loadOverview(since) {
 }
 
 // ── loadSessions + renderSessions + filterLogsToSession ───────────────────────
-async function loadSessions(since) {
+function loadSessions(since) {
   const emptyState = (msg) => {
     ['sess-total','sess-avg-turns','sess-avg-cost','sess-avg-duration'].forEach(id => {
       const el = document.getElementById(id); if (el) el.textContent = '—';
@@ -339,11 +223,7 @@ async function loadSessions(since) {
     allSessions = [];
   };
 
-  // Step 1 — aggregate agent_call_log by execution_id (sum procMs + cost)
-  const agentRows = await fetchAll(() => sb.from('agent_call_log')
-    .select('execution_id,processing_time_ms,total_cost_thb')
-    .gte('started_at', since)
-    .order('started_at', { ascending: false }));
+  const agentRows = (dashboardData.agentCallLog || []).filter(r => r.started_at >= since);
   if (!agentRows.length) { emptyState('No agent call data in this period'); renderSessions(); return; }
 
   const agentByExec = {};
@@ -355,23 +235,13 @@ async function loadSessions(since) {
   });
   const agentExecIds = Object.keys(agentByExec);
 
-  // Step 2 — inner join with workflow_agent_flags on execution_id
-  const flagRows = await fetchFlagsInChunks(agentExecIds, 'execution_id');
-  const flagExecSet = new Set(flagRows.map(r => r.execution_id));
+  const flagExecSet = new Set((dashboardData.flagRows || []).map(r => r.execution_id));
   const matchedExecIds = agentExecIds.filter(eid => flagExecSet.has(eid));
   if (!matchedExecIds.length) { emptyState('No sessions found (no execution_id overlap between agent_call_log and workflow_agent_flags)'); renderSessions(); return; }
 
-  // Step 3 — fetch execution_log for matched execution_ids (chunked IN query)
-  const CHUNK = 100;
-  const execData = [];
-  for (let i = 0; i < matchedExecIds.length; i += CHUNK) {
-    const { data } = await sb.from('execution_log')
-      .select('execution_id,session_id,customer_id,started_at,route_to,status')
-      .in('execution_id', matchedExecIds.slice(i, i + CHUNK));
-    if (data) execData.push(...data);
-  }
+  const matchedSet = new Set(matchedExecIds);
+  const execData = (dashboardData.executionLog || []).filter(r => matchedSet.has(r.execution_id) && r.started_at >= since);
 
-  // Step 4 — group by session_id; sum agent procMs and cost per session
   const sessionMap = {};
   execData.forEach(r => {
     if (!r.session_id) return;
@@ -408,7 +278,6 @@ async function loadSessions(since) {
   document.getElementById('sess-avg-cost').textContent = fmtThb(avgCost);
   document.getElementById('sess-avg-duration').textContent = fmtDuration(avgDurMs);
 
-  // Sessions by day chart
   const byDay = {};
   allSessions.forEach(s => { const d = toLocalDate(s.first); byDay[d]=(byDay[d]||0)+1; });
   const days = Object.keys(byDay).sort();
@@ -418,7 +287,6 @@ async function loadSessions(since) {
     options:{ ...baseOpts }
   });
 
-  // Turns-per-session distribution bars
   const bucketLabels = ['1 turn','2–3','4–5','6–10','10+'];
   const buckets = [0,0,0,0,0];
   allSessions.forEach(s => {
@@ -444,7 +312,6 @@ function renderSessions() {
 
   const routeColors = { advisor:'#4f8ef7', education:'#2dd4bf', summary:'#a78bfa', unknown:'#f59e0b' };
 
-  // Fix #4: fmtId for session/customer
   document.getElementById('sess-table').innerHTML = filtered.slice(0,100).map(s => {
     const durMs = s.totalWallMs || 0;
     const first = s.first ? new Date(s.first).toLocaleString() : '—';
@@ -481,15 +348,10 @@ function filterLogsToSession(sessionId) {
 }
 
 // ── loadAI ────────────────────────────────────────────────────────────────────
-async function loadAI(since) {
-  // Fetch ALL agent calls in the period — ORDER DESC so newest rows survive the limit
-  const rows = await fetchAll(() => sb.from('agent_call_log')
-    .select('agent_name,workflow_name,input_tokens,output_tokens,total_tokens,total_cost_thb,input_cost_usd,output_cost_usd,total_cost_usd,processing_time_ms,started_at')
-    .gte('started_at', since)
-    .order('started_at', { ascending: false }));
+function loadAI(since) {
+  const rows = (dashboardData.agentCallLog || []).filter(r => r.started_at >= since);
   if (!rows.length) return;
 
-  // ── 1. Summary totals ─────────────────────────────────────────────────────────
   const totalCalls     = rows.length;
   const totalInp       = rows.reduce((s,r) => s + (r.input_tokens||0),    0);
   const totalOut       = rows.reduce((s,r) => s + (r.output_tokens||0),   0);
@@ -507,8 +369,6 @@ async function loadAI(since) {
   document.getElementById('ai-cost-thb').textContent = fmtThb(totalCostThb);
   document.getElementById('ai-cost-usd').textContent = '$' + fmt(totalCostUsd, 4) + ' USD';
 
-  // ── 2. Avg cost per LLM call by route — grouped by normalizeWfName ───────────
-  // Uses workflow_name from agent_call_log only (no execution_log join needed)
   const routeCost = {
     all:       { sum: 0, cnt: 0 },
     advisor:   { sum: 0, cnt: 0 },
@@ -529,7 +389,6 @@ async function loadAI(since) {
   document.getElementById('ai-cppt-edu').textContent = avgOrDash(routeCost.education);
   document.getElementById('ai-cppt-sum').textContent = avgOrDash(routeCost.summary);
 
-  // ── 3. Token usage trend chart (by local date) ───────────────────────────────
   const byDay = {};
   rows.forEach(r => {
     const d = toLocalDate(r.started_at);
@@ -550,7 +409,6 @@ async function loadAI(since) {
     },
   });
 
-  // ── 4. Cost by workflow bar chart (normalized names) ─────────────────────────
   const wfCost = {};
   rows.forEach(r => {
     const wf = normalizeWfName(r.workflow_name||'') || r.workflow_name || 'unknown';
@@ -563,7 +421,6 @@ async function loadAI(since) {
     options: { ...baseOpts, indexAxis: 'y' },
   });
 
-  // ── 5. Agent breakdown table — group by agent_name, avg per request ───────────
   const agentMap = {};
   rows.forEach(r => {
     const a  = r.agent_name || 'unknown';
@@ -598,25 +455,17 @@ async function loadAI(since) {
 }
 
 // ── loadSubworkflows ──────────────────────────────────────────────────────────
-async function loadSubworkflows(since) {
-  const execRows = await fetchAll(() => sb.from('execution_log').select('execution_id,session_id,workflow_id,started_at,wall_time_ms,route_to,output_guardrail_triggered').gte('started_at', since).order('started_at', { ascending: false }));
-  const agentRowsRaw = await fetchAll(() => sb.from('agent_call_log')
-    .select('execution_id,workflow_name,input_tokens,output_tokens,total_tokens,total_cost_thb,processing_time_ms,started_at')
-    .gte('started_at', since)
-    .order('started_at', { ascending: false }));
+function loadSubworkflows(since) {
+  const execRows = (dashboardData.executionLog || []).filter(r => r.started_at >= since);
+  const agentRows = (dashboardData.agentCallLog || []).filter(r => r.started_at >= since);
 
-  const uniqueExecRows = [...new Map((execRows||[]).map(r => [r.execution_id, r])).values()];
+  const uniqueExecRows = [...new Map(execRows.map(r => [r.execution_id, r])).values()];
   const chatBotExecRows = uniqueExecRows.filter(r => r.workflow_id === MAIN_WF_ID);
   const totalExec = chatBotExecRows.length;
   const execIds = new Set(chatBotExecRows.map(r => r.execution_id));
-  // agent_call_log execution_ids are sub-workflow IDs — not filterable by execIds
-  const agentRows = agentRowsRaw;
 
-  const rawFlags = await fetchFlagsInChunks([...execIds], '*');
+  const rawFlags = (dashboardData.flagRows || []).filter(f => execIds.has(f.execution_id));
 
-  // Supplement missing flags from execution_log.route_to.
-  // workflow_agent_flags may not set used_advisor/education/summary even when those
-  // sub-workflows ran — route_to in execution_log is the reliable source for those.
   const flagsById = {};
   rawFlags.forEach(f => { flagsById[f.execution_id] = {...f}; });
   chatBotExecRows.forEach(r => {
@@ -625,7 +474,6 @@ async function loadSubworkflows(since) {
     if (route === 'advisor')   flagsById[r.execution_id].used_advisor   = true;
     if (route === 'education') flagsById[r.execution_id].used_education = true;
     if (route === 'summary')   flagsById[r.execution_id].used_summary   = true;
-    // output guardrail: infer from output_guardrail_triggered if present
     if (r.output_guardrail_triggered) flagsById[r.execution_id].used_output_guardrail = true;
   });
   const relevantFlags = Object.values(flagsById);
@@ -639,14 +487,12 @@ async function loadSubworkflows(since) {
     { key:'used_output_guardrail', label:'Output guardrail',   color:'#4f8ef7' },
   ];
 
-  // Activation counts
   const swCounts = {};
   SW.forEach(s => { swCounts[s.key] = relevantFlags.filter(r => r[s.key]).length; });
 
-  const flagCoverage = rawFlags.length; // executions that have an actual workflow_agent_flags row
-  const missingFlags = totalExec - flagCoverage; // executions supplemented from route_to only
+  const flagCoverage = rawFlags.length;
+  const missingFlags = totalExec - flagCoverage;
 
-  // Metrics cards
   document.getElementById('sw-metrics').innerHTML = [
     { label:'Total conversations', val: totalExec.toLocaleString(), cls:'blue', sub:'chat-bot sessions · in period' },
     { label:'Classification rate', val: totalExec ? fmt((swCounts.used_classification/totalExec)*100)+'%' : '—', cls:'teal',
@@ -654,19 +500,16 @@ async function loadSubworkflows(since) {
     { label:'Escalation to staff', val: swCounts.used_summary||0, cls:'amber', sub:'reached summary' },
   ].map(m => `<div class="metric-card ${m.cls}"><div class="metric-label">${m.label}</div><div class="metric-value ${m.cls}">${m.val}</div><div class="metric-sub">${m.sub}</div></div>`).join('');
 
-  // Activation bars
   document.getElementById('sw-activation-bars').innerHTML = SW.map(s => {
     const cnt = swCounts[s.key]||0;
     const pct = totalExec ? Math.round((cnt/totalExec)*100) : 0;
     return `<div class="prog-row"><span class="prog-label">${s.label}</span><div class="prog-bg"><div class="prog-fill" style="width:${pct}%;background:${s.color}"></div></div><span class="prog-val">${pct}%</span></div>`;
   }).join('');
 
-  // ── Per-sub-workflow detail: use ONLY agent_call_log ──────────────────────────
-  // Step 1: group by (normalized workflow_name, execution_id) → sum metrics
   const byWfExec = {};
-  (agentRows||[]).forEach(r => {
+  agentRows.forEach(r => {
     const wfName = normalizeWfName(r.workflow_name||'');
-    if (!wfName) return; // skip blank / unknown
+    if (!wfName) return;
     const key = wfName + '::' + (r.execution_id||'');
     if (!byWfExec[key]) byWfExec[key] = {wfName, procMs:0, inp:0, out:0, cost:0};
     byWfExec[key].procMs += (r.processing_time_ms||0);
@@ -675,7 +518,6 @@ async function loadSubworkflows(since) {
     byWfExec[key].cost   += (r.total_cost_thb||0);
   });
 
-  // Step 2: group by workflow_name → accumulate per-execution values for averaging
   const wfDetail = {};
   Object.values(byWfExec).forEach(item => {
     const lcKey = item.wfName.toLowerCase();
@@ -687,10 +529,7 @@ async function loadSubworkflows(since) {
     wfDetail[lcKey].sumCost   += item.cost;
   });
 
-  // Sort by avg latency descending
   const detailEntries = Object.values(wfDetail).sort((a,b) => (b.sumProcMs/b.runs) - (a.sumProcMs/a.runs));
-
-  // Avg latency comparison chart — labels must match the table
   const chartLabels = detailEntries.map(e => e.label);
   const chartAvgMs  = detailEntries.map(e => Math.round(e.sumProcMs / e.runs));
   mkChart('sw-chart-latency', {
@@ -699,7 +538,6 @@ async function loadSubworkflows(since) {
     options:{ ...baseOpts, indexAxis:'y', scales:{ x:{...baseOpts.scales.x, ticks:{ ...baseOpts.scales.x.ticks, callback: v => v+'ms' }}, y:baseOpts.scales.y } }
   });
 
-  // Per sub-workflow detail table
   document.getElementById('sw-table').innerHTML = detailEntries.map(e => {
     const avgLat  = Math.round(e.sumProcMs / e.runs);
     const avgInp  = Math.round(e.sumInp    / e.runs);
@@ -719,10 +557,8 @@ async function loadSubworkflows(since) {
 }
 
 // ── loadGuardrails ────────────────────────────────────────────────────────────
-async function loadGuardrails(since) {
-  const rows = await fetchAll(() => sb.from('execution_log')
-    .select('execution_id,session_id,started_at,input_guardrail_triggered,output_guardrail_triggered,output_guardrail_nsfw,output_guardrail_hallucination,status,user_message,ai_reply')
-    .gte('started_at', since));
+function loadGuardrails(since) {
+  const rows = (dashboardData.executionLog || []).filter(r => r.started_at >= since);
   if (!rows.length) return;
 
   const total = rows.length;
@@ -738,7 +574,6 @@ async function loadGuardrails(since) {
   document.getElementById('gr-halluc').textContent   = halluc;
   document.getElementById('gr-nsfw').textContent     = nsfw;
 
-  // Trend chart — Fix #3: use toLocalDate
   const byDay = {};
   rows.forEach(r => {
     const d = toLocalDate(r.started_at) || 'x';
@@ -756,7 +591,6 @@ async function loadGuardrails(since) {
     options:{ ...baseOpts, plugins:{ ...baseOpts.plugins, legend:{ display:true, labels:{ color:'#8b93a8', font:{size:11} } } } }
   });
 
-  // Donut
   const totalFlags = inpBlock + outBlock + nsfw + halluc;
   document.getElementById('gr-total-flags').textContent = totalFlags;
   const donutLabels = ['Input blocked','Output blocked','NSFW','Hallucination'];
@@ -769,7 +603,6 @@ async function loadGuardrails(since) {
   });
   document.getElementById('gr-legend').innerHTML = donutLabels.map((l,i)=>`<div class="legend-item"><div class="legend-dot" style="background:${donutColors[i]}"></div>${l}: ${donutData[i]}</div>`).join('');
 
-  // Table — Fix #4: fmtId for session_id
   const events = rows.filter(r=>r.input_guardrail_triggered||r.output_guardrail_triggered).slice(0,50);
   document.getElementById('gr-table').innerHTML = events.map(r => {
     const isInp = r.input_guardrail_triggered;
@@ -789,19 +622,16 @@ async function loadGuardrails(since) {
 }
 
 // ── loadRouting ───────────────────────────────────────────────────────────────
-async function loadRouting(since) {
-  const rawRows = await fetchAll(() => sb.from('execution_log')
-    .select('execution_id,route_to,started_at,need_staff_contact,status,reply_type,session_id,workflow_id')
-    .gte('started_at', since)
-    .order('started_at', { ascending: false }));
+function loadRouting(since) {
+  const rawRows = (dashboardData.executionLog || []).filter(r => r.started_at >= since);
   if (!rawRows.length) return;
 
   const rows = [...new Map(rawRows.filter(r => r.workflow_id === MAIN_WF_ID).map(r => [r.execution_id, r])).values()];
   const total = rows.length;
   const execIds = rows.map(r => r.execution_id);
+  const execIdSet = new Set(execIds);
 
-  // Fetch classification flags to identify bypassed conversations (chunked to avoid URL length limit)
-  const flagRows = await fetchFlagsInChunks(execIds, 'execution_id,used_classification');
+  const flagRows = (dashboardData.flagRows || []).filter(f => execIdSet.has(f.execution_id));
   const classifiedSet = new Set(flagRows.filter(r => r.used_classification).map(r => r.execution_id));
   const classifiedCount = classifiedSet.size;
   const bypassCount = total - classifiedCount;
@@ -809,7 +639,6 @@ async function loadRouting(since) {
   const cnts = {advisor:0,education:0,summary:0,unknown:0};
   rows.forEach(r => { const k = (r.route_to||'unknown').toLowerCase(); if (cnts[k]!==undefined) cnts[k]++; else cnts.unknown++; });
 
-  // Split Summary and Unknown by whether classification ran
   const classifiedSummary = rows.filter(r => (r.route_to||'').toLowerCase() === 'summary' && classifiedSet.has(r.execution_id)).length;
   const bypassSummary     = cnts.summary - classifiedSummary;
   const classifiedUnknown = rows.filter(r => ((r.route_to||'unknown').toLowerCase() === 'unknown' || !r.route_to) && classifiedSet.has(r.execution_id)).length;
@@ -821,14 +650,12 @@ async function loadRouting(since) {
     document.getElementById('rt-'+k).textContent = cnt.toLocaleString();
     document.getElementById('rt-'+k+'-pct').textContent = total ? fmt((cnt/total)*100)+'% of conversations' : '—';
   });
-  // Annotate sub-labels to show the split
   document.getElementById('rt-sum-pct').textContent =
     `${classifiedSummary} via classification · ${bypassSummary} direct bypass`;
   document.getElementById('rt-unk-pct').textContent =
     `${classifiedUnknown} classified unknown · ${blockUnknown} guardrail blocked`;
   document.getElementById('rt-total').textContent = total;
 
-  // Donut
   const rtColors = ['#4f8ef7','#2dd4bf','#a78bfa','#f59e0b'];
   const rtLabels = ['Advisor','Education','Summary','Unknown'];
   const rtData   = [cnts.advisor, cnts.education, cnts.summary, cnts.unknown];
@@ -839,7 +666,6 @@ async function loadRouting(since) {
   });
   document.getElementById('rt-legend').innerHTML = rtLabels.map((l,i)=>`<div class="legend-item"><div class="legend-dot" style="background:${rtColors[i]}"></div>${l}: ${rtData[i]}</div>`).join('');
 
-  // Trend chart — Fix #3: use toLocalDate
   const byDay = {};
   rows.forEach(r => {
     const d = toLocalDate(r.started_at) || 'x';
@@ -853,7 +679,6 @@ async function loadRouting(since) {
     options:{ ...baseOpts, plugins:{ ...baseOpts.plugins, legend:{ display:true, labels:{ color:'#8b93a8', font:{size:11} } } }, scales:{ x:{...baseOpts.scales.x,stacked:true}, y:{...baseOpts.scales.y,stacked:true} } }
   });
 
-  // Escalation
   const escl = rows.filter(r=>r.need_staff_contact).length;
   const confirmed = rows.filter(r=>(r.route_to||'').toLowerCase()==='summary').length;
   document.getElementById('rt-escl').textContent = escl;
@@ -861,26 +686,18 @@ async function loadRouting(since) {
   document.getElementById('rt-escl-rate').textContent = total ? fmt((escl/total)*100)+'%' : '—';
   document.getElementById('rt-confirmed').textContent = confirmed;
 
-  // Bypass metric — bypassSummary = JSON offerCard direct-to-summary; blockUnknown = guardrail-blocked
   document.getElementById('rt-bypass').textContent = bypassCount;
   document.getElementById('rt-bypass-sub').textContent =
     `${bypassSummary} direct→summary · ${blockUnknown} guardrail blocked`;
 }
 
 // ── loadErrors ────────────────────────────────────────────────────────────────
-async function loadErrors(since) {
-  const [execErrors, httpErrors, allExec] = await Promise.all([
-    fetchAll(() => sb.from('execution_log')
-      .select('execution_id,session_id,started_at,status,error_message,route_to')
-      .in('status',['error','guardrail_blocked'])
-      .gte('started_at', since)),
-    fetchAll(() => sb.from('http_request_log')
-      .select('execution_id,node_name,workflow_name,url,response_status,error_message,started_at,success')
-      .eq('success', false)
-      .gte('started_at', since)),
-    fetchAll(() => sb.from('execution_log').select('id').gte('started_at', since)),
-  ]);
-  const total = allExec.length;
+function loadErrors(since) {
+  const execErrors = (dashboardData.executionLog || [])
+    .filter(r => r.started_at >= since && (r.status === 'error' || r.status === 'guardrail_blocked'));
+  const httpErrors = (dashboardData.httpErrors || []).filter(r => r.started_at >= since);
+  const total = (dashboardData.executionLog || []).filter(r => r.started_at >= since).length;
+
   const errCount = execErrors.length;
   const httpErrCount = httpErrors.length;
   const guardrailCount = execErrors.filter(r=>r.status==='guardrail_blocked').length;
@@ -890,7 +707,6 @@ async function loadErrors(since) {
   document.getElementById('er-http').textContent = httpErrCount;
   document.getElementById('er-guardrail').textContent = guardrailCount;
 
-  // Error trend — Fix #3: use toLocalDate
   const byDay = {};
   execErrors.forEach(r => {
     const d = toLocalDate(r.started_at) || 'x';
@@ -903,9 +719,8 @@ async function loadErrors(since) {
     options:{ ...baseOpts }
   });
 
-  // HTTP error breakdown
   const httpByStatus = {};
-  (httpErrors||[]).forEach(r => {
+  httpErrors.forEach(r => {
     const k = (r.response_status||'timeout') + ' — ' + (r.node_name||'unknown');
     httpByStatus[k] = (httpByStatus[k]||0) + 1;
   });
@@ -914,7 +729,6 @@ async function loadErrors(since) {
     `<div class="prog-row"><span class="prog-label">${escHtml(label)}</span><div class="prog-bg"><div class="prog-fill" style="width:${Math.round((cnt/maxHttpErr)*100)}%;background:var(--red)"></div></div><span class="prog-val">${cnt}</span></div>`
   ).join('') || '<div style="color:var(--text3);font-size:13px;padding:8px 0">No HTTP errors 🎉</div>';
 
-  // Error table — Fix #4: fmtId for session
   const combinedErrors = [
     ...execErrors.map(r=>({ time:r.started_at, session:r.session_id, type: r.status==='guardrail_blocked'?'Guardrail':'Execution error', detail:r.error_message||r.status, node:'—' })),
     ...httpErrors.map(r=>({ time:r.started_at, session:r.execution_id, type:'HTTP error', detail:(r.response_status||'timeout')+' '+escHtml(r.url||''), node:r.node_name||'—' })),
@@ -933,24 +747,14 @@ async function loadErrors(since) {
 }
 
 // ── loadLogs + renderLogs + filterLogs + logPage ──────────────────────────────
-async function loadLogs(since) {
-  const [agentRows, execRows] = await Promise.all([
-    fetchAll(() => sb.from('agent_call_log')
-      .select('execution_id,agent_name,workflow_name,input_tokens,output_tokens,total_tokens,total_cost_thb,processing_time_ms,started_at')
-      .gte('started_at', since)
-      .order('started_at', { ascending: false })),
-    fetchAll(() => sb.from('execution_log')
-      .select('execution_id,session_id,customer_id,route_to,status,workflow_id,started_at,wall_time_ms')
-      .gte('started_at', since)),
-  ]);
-
+// Shows the last 50 agent_call_log rows (pre-sliced by the collect service)
+function loadLogs() {
+  // Build exec map from all execution log rows
   allLogExecMap = {};
-  execRows.forEach(r => { allLogExecMap[r.execution_id] = r; });
+  (dashboardData.executionLog || []).forEach(r => { allLogExecMap[r.execution_id] = r; });
 
-  // Build the set of execution_ids that are part of chat-bot conversations.
-  // Sub-workflow rows have session_id=null, so we identify them via time-window overlap
-  // with main workflow executions.
-  const mainWins = (execRows||[])
+  // Build chat set via time-window join
+  const mainWins = (dashboardData.executionLog || [])
     .filter(r => r.workflow_id === MAIN_WF_ID)
     .map(r => ({
       start: new Date(r.started_at).getTime(),
@@ -959,7 +763,7 @@ async function loadLogs(since) {
     .sort((a,b) => a.start - b.start);
 
   allLogChatSet = new Set();
-  (execRows||[]).forEach(r => {
+  (dashboardData.executionLog || []).forEach(r => {
     if (r.workflow_id === MAIN_WF_ID || r.session_id) {
       allLogChatSet.add(r.execution_id);
       return;
@@ -971,7 +775,7 @@ async function loadLogs(since) {
     }
   });
 
-  allLogs = agentRows;
+  allLogs = dashboardData.logRows || [];
   logPageNum = 1;
   renderLogs();
 }
@@ -998,11 +802,10 @@ function renderLogs() {
   logPageNum = Math.min(logPageNum, totalPages);
   const page = filtered.slice((logPageNum-1)*LOG_PAGE_SIZE, logPageNum*LOG_PAGE_SIZE);
 
-  document.getElementById('log-page-info').textContent = `Page ${logPageNum} / ${totalPages} (${filtered.length} rows)`;
+  document.getElementById('log-page-info').textContent = `${filtered.length} rows (last ${allLogs.length} collected)`;
   document.getElementById('log-prev').disabled = logPageNum <= 1;
   document.getElementById('log-next').disabled = logPageNum >= totalPages;
 
-  // Fix #4: fmtId for session/customer
   document.getElementById('log-table').innerHTML = page.map(r => {
     const ex = allLogExecMap[r.execution_id] || {};
     const agentLabel = [r.agent_name, r.workflow_name].filter(Boolean).join(' · ') || '—';
@@ -1026,11 +829,15 @@ async function openDrawer(execId) {
   document.getElementById('drawerTitle').textContent = 'Execution · …'+String(execId).slice(-8);
   document.getElementById('drawerBody').innerHTML = '<div class="state-box"><div class="spinner"></div><span>Loading…</span></div>';
 
-  const [{ data: exec }, { data: agents }, { data: httpReqs }] = await Promise.all([
-    sb.from('execution_log').select('*').eq('execution_id', execId).single(),
-    sb.from('agent_call_log').select('*').eq('execution_id', execId).order('started_at'),
-    sb.from('http_request_log').select('*').eq('execution_id', execId).order('started_at'),
-  ]);
+  let exec, agents, httpReqs;
+  try {
+    const res = await fetch('/api/drawer?id=' + encodeURIComponent(execId));
+    if (!res.ok) throw new Error(res.statusText);
+    ({ exec, agents, httpReqs } = await res.json());
+  } catch (e) {
+    document.getElementById('drawerBody').innerHTML = `<div class="state-box">Failed to load: ${escHtml(e.message)}</div>`;
+    return;
+  }
 
   if (!exec) { document.getElementById('drawerBody').innerHTML = '<div class="state-box">Execution not found</div>'; return; }
 
